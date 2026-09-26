@@ -1,3 +1,7 @@
+use std::path::PathBuf;
+
+use clap::Parser;
+
 use crate::shaders::{ShaderMetadata, types::TypeInfo};
 
 mod shaders;
@@ -17,14 +21,30 @@ pub fn compile_wgsl(
     Ok((module, module_info))
 }
 
+#[derive(clap::Parser)]
+#[command(version, about)]
+pub struct Args {
+    #[arg(value_name = "SCHEMA")]
+    input: PathBuf,
+
+    /// Write the generated TypeScript to this file instead of stdout
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
 fn main() -> color_eyre::Result<()> {
-    let wgsl_source = include_str!("../examples/init.wgsl");
-    let module = naga::front::wgsl::parse_str(wgsl_source)?;
+    color_eyre::install()?;
+
+    let args = Args::parse();
+    let wgsl_source = std::fs::read_to_string(&args.input)?;
+    let module = naga::front::wgsl::parse_str(&wgsl_source)?;
     let shader = ShaderMetadata::new(&module)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&shader.generate_bindings()).unwrap()
-    );
+    let output_content = serde_json::to_string_pretty(&shader.generate_bindings()).unwrap();
+    if let Some(output) = args.output {
+        std::fs::write(output, output_content)?;
+    } else {
+        println!("{}", output_content)
+    }
 
     Ok(())
 }

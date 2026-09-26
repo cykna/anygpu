@@ -1,15 +1,11 @@
 [package]
-name = "anygpu"
+name = "anygpu-gen-ts"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
-members = ["anygpu-ts"]
-resolver = "3"
-
 [dependencies]
-color-eyre = "0.6.5"
+anygpu.path="../"
 clap = {version = "4.6.7", features = ["derive"]}
-naga = {version = "30.0.1", features = ["wgsl-in"]}
+color-eyre = "0.6.5"
 serde = {version = "1.0.229", features=["derive"]}
 serde_json = "1.0.151"

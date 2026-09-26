@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use crate::shaders::types::TypeInfo;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ShaderBindings {
-    types: Vec<TypeInfo>,
+    pub types: Vec<TypeInfo>,
 }
 #[derive(Debug)]
 pub struct ShaderMetadata<'a> {

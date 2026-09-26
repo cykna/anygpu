@@ -5,15 +5,15 @@ use crate::shaders::ShaderMetadata;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScalarInfo {
-    name: String,
-    width: u8,
+    pub name: String,
+    pub width: u8,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MemberDescriptor {
-    name: String,
-    offset: u32,
-    ty: Box<TypeInfo>,
+    pub name: String,
+    pub offset: u32,
+    pub ty: Box<TypeInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
