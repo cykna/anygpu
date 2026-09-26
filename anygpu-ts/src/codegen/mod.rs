@@ -1,3 +1,4 @@
+pub mod descriptors;
 mod emit;
 mod registry;
 mod scalar;
@@ -59,7 +60,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::codegen::emit::{Access, member_access};
+    use crate::codegen::descriptors::Access;
+    use crate::codegen::emit::member_access;
     use crate::codegen::view::ViewKind;
 
     fn f32() -> ScalarInfo {
@@ -345,8 +347,10 @@ mod tests {
 
         let expected = concat!(
             "export class Vector4f32 {\n",
-            "  buffer: Float32Array;\n",
-            "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  public buffer: Float32Array;\n",
+            "  constructor(buffer: Float32Array) {\n",
+            "    this.buffer = buffer;\n",
+            "  }\n",
             "  static view(buffer: Float32Array): Vector4f32 { const self = Object.create(Vector4f32.prototype) as Vector4f32; self.buffer = buffer; return self; }\n",
             "  get x(): number { return this.buffer[0]; }\n",
             "  set x(v: number) { this.buffer[0] = v; }\n",
@@ -359,8 +363,10 @@ mod tests {
             "}\n",
             "\n",
             "export class Mat4x4f32 {\n",
-            "  buffer: Float32Array;\n",
-            "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  public buffer: Float32Array;\n",
+            "  constructor(buffer: Float32Array) {\n",
+            "    this.buffer = buffer;\n",
+            "  }\n",
             "  static view(buffer: Float32Array): Mat4x4f32 { const self = Object.create(Mat4x4f32.prototype) as Mat4x4f32; self.buffer = buffer; return self; }\n",
             "  get m00(): number { return this.buffer[0]; }\n",
             "  set m00(v: number) { this.buffer[0] = v; }\n",
@@ -398,14 +404,14 @@ mod tests {
             "\n",
             "export class Camera {\n",
             "  public buffer: Float32Array;\n",
-            "  static view(buffer: Float32Array): Camera { const self = Object.create(Camera.prototype) as Camera; self.buffer = buffer; return self; }\n",
-            "  get position(): Vector4f32 { return Vector4f32.view(this.buffer.subarray(0, 4)); }\n",
-            "  get rot(): Mat4x4f32 { return Mat4x4f32.view(this.buffer.subarray(4, 20)); }\n",
             "  constructor(position: Vector4f32, rot: Mat4x4f32) {\n",
             "    this.buffer = new Float32Array(20); // 80 bytes / 4\n",
             "    this.buffer.set(position.buffer, 0); // offset 0 bytes / 4 = 0\n",
             "    this.buffer.set(rot.buffer, 4); // offset 16 bytes / 4 = 4\n",
             "  }\n",
+            "  static view(buffer: Float32Array): Camera { const self = Object.create(Camera.prototype) as Camera; self.buffer = buffer; return self; }\n",
+            "  get position(): Vector4f32 { return Vector4f32.view(this.buffer.subarray(0, 4)); }\n",
+            "  get rot(): Mat4x4f32 { return Mat4x4f32.view(this.buffer.subarray(4, 20)); }\n",
             "}\n",
         );
         assert_eq!(typescript, expected);
