@@ -1,5 +1,8 @@
 mod shaders;
+pub use naga;
 pub use serde;
 pub use serde_json;
 pub use shaders::ShaderBindings;
+pub use shaders::ShaderMetadata;
+pub use shaders::image::*;
 pub use shaders::types::*;

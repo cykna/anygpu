@@ -1,3 +1,4 @@
+pub mod image;
 pub mod types;
 use naga::{Handle, Module, Type, TypeInner, proc::Layouter};
 use serde::{Deserialize, Serialize};

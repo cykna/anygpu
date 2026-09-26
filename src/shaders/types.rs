@@ -1,12 +1,31 @@
 use naga::{ArraySize, Handle, ScalarKind, Type, TypeInner, VectorSize, proc::Alignment};
 use serde::{Deserialize, Serialize};
 
-use crate::shaders::ShaderMetadata;
+use crate::shaders::{
+    ShaderMetadata,
+    image::{ImageClass, ImageDimension, StorageAccess, StorageFormat},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ScalarInfo {
     pub name: String,
     pub width: u8,
+}
+
+impl ScalarInfo {
+    pub fn from_kind(kind: ScalarKind, width: u8) -> Self {
+        let kind_str = match kind {
+            naga::ScalarKind::Sint => "sint",
+            naga::ScalarKind::Uint => "uint",
+            naga::ScalarKind::Float => "float",
+            naga::ScalarKind::Bool => "bool",
+            _ => unreachable!(),
+        };
+        ScalarInfo {
+            name: kind_str.to_string(),
+            width,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,7 +72,11 @@ pub enum TypeDescriptor {
     Sampler {
         comparison: bool,
     },
-    Image,
+    Image {
+        dimension: ImageDimension,
+        arrayed: bool,
+        class: ImageClass,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,20 +86,6 @@ pub struct TypeInfo {
 }
 
 impl<'a> ShaderMetadata<'a> {
-    fn scalar_info(kind: naga::ScalarKind, width: u8) -> ScalarInfo {
-        let kind_str = match kind {
-            naga::ScalarKind::Sint => "sint",
-            naga::ScalarKind::Uint => "uint",
-            naga::ScalarKind::Float => "float",
-            naga::ScalarKind::Bool => "bool",
-            _ => unreachable!(),
-        };
-        ScalarInfo {
-            name: kind_str.to_string(),
-            width,
-        }
-    }
-
     fn scalar_name(kind: ScalarKind, width: u8) -> String {
         match (kind, width) {
             (ScalarKind::Sint, 4) => "i32".to_string(),
@@ -101,12 +110,12 @@ impl<'a> ShaderMetadata<'a> {
         let ty = self.module.types.get_handle(handle).unwrap();
         let descriptor = match &ty.inner {
             TypeInner::Scalar(s) => TypeDescriptor::Scalar {
-                scalar: Self::scalar_info(s.kind, s.width),
+                scalar: ScalarInfo::from_kind(s.kind, s.width),
             },
 
             TypeInner::Vector { size, scalar } => TypeDescriptor::Vector {
                 length: Self::vec_size_n(*size),
-                scalar: Self::scalar_info(scalar.kind, scalar.width),
+                scalar: ScalarInfo::from_kind(scalar.kind, scalar.width),
             },
 
             TypeInner::Matrix {
@@ -116,11 +125,11 @@ impl<'a> ShaderMetadata<'a> {
             } => TypeDescriptor::Matrix {
                 columns: Self::vec_size_n(*columns),
                 rows: Self::vec_size_n(*rows),
-                scalar: Self::scalar_info(scalar.kind, scalar.width),
+                scalar: ScalarInfo::from_kind(scalar.kind, scalar.width),
             },
 
             TypeInner::Atomic(s) => TypeDescriptor::Atomic {
-                scalar: Self::scalar_info(s.kind, s.width),
+                scalar: ScalarInfo::from_kind(s.kind, s.width),
             },
 
             TypeInner::Array { base, size, stride } => TypeDescriptor::Array {
@@ -163,7 +172,31 @@ impl<'a> ShaderMetadata<'a> {
                 base: Box::new(self.get_type_info(*base)),
             },
 
-            TypeInner::Image { .. } => TypeDescriptor::Image,
+            TypeInner::Image {
+                dim,
+                arrayed,
+                class,
+            } => TypeDescriptor::Image {
+                dimension: match dim {
+                    naga::ImageDimension::Cube => ImageDimension::Cube,
+                    naga::ImageDimension::D1 => ImageDimension::D1,
+                    naga::ImageDimension::D2 => ImageDimension::D2,
+                    naga::ImageDimension::D3 => ImageDimension::D3,
+                },
+                arrayed: *arrayed,
+                class: match class {
+                    naga::ImageClass::Depth { multi } => ImageClass::Depth { multi: *multi },
+                    naga::ImageClass::Sampled { kind, multi } => ImageClass::Sampled {
+                        kind: ScalarInfo::from_kind(*kind, 0),
+                        multi: *multi,
+                    },
+                    naga::ImageClass::Storage { format, access } => ImageClass::Storage {
+                        format: StorageFormat::from(*format),
+                        access: StorageAccess::from(*access),
+                    },
+                    naga::ImageClass::External => ImageClass::External,
+                },
+            },
 
             TypeInner::Sampler { comparison } => TypeDescriptor::Sampler {
                 comparison: *comparison,
