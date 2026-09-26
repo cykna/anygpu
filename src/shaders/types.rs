@@ -263,7 +263,7 @@ impl<'a> ShaderMetadata<'a> {
                     match size {
                         ArraySize::Constant(n) => format!("array<{}, {}>", base_name, n),
                         ArraySize::Dynamic => format!("array<{}>", base_name),
-                        ArraySize::Pending(p) => format!("array<pending>"),
+                        ArraySize::Pending(_) => format!("array<pending>"),
                     }
                 }
 
