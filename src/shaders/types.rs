@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::shaders::ShaderMetadata;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ScalarInfo {
     pub name: String,
     pub width: u8,

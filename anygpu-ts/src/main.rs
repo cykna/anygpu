@@ -1,6 +1,6 @@
 mod codegen;
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
