@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::{
+    ffi::OsStr,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 use clap::Parser;
 
@@ -34,11 +38,8 @@ pub struct Args {
     validate: bool,
 }
 
-fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
-
-    let args = Args::parse();
-    let wgsl_source = std::fs::read_to_string(&args.input)?;
+fn compile_entry(args: &Args, entry: &Path) -> color_eyre::Result<String> {
+    let wgsl_source = std::fs::read_to_string(&entry)?;
     let module = naga::front::wgsl::parse_str(&wgsl_source)?;
     if args.validate {
         naga::valid::Validator::new(
@@ -50,11 +51,36 @@ fn main() -> color_eyre::Result<()> {
         .validate(&module)?;
     }
     let shader = ShaderMetadata::new(&module)?;
-    let output_content = serde_json::to_string_pretty(&shader.generate_bindings()).unwrap();
-    if let Some(output) = args.output {
-        std::fs::write(output, output_content)?;
+    let output_content = serde_json::to_string_pretty(&shader.generate_bindings())?;
+    Ok(output_content)
+}
+
+fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
+    let args = Args::parse();
+    if let Ok(entry) = args.input.read_dir() {
+        let output_dir = args.output.as_ref().unwrap_or(&args.input);
+        std::fs::create_dir_all(output_dir)?;
+        for entry in entry {
+            let entry = entry?;
+            if entry.path().extension() != Some(OsStr::from_bytes(b"wgsl")) {
+                continue;
+            }
+            let output_content = compile_entry(&args, &entry.path())?;
+            let output_dir = output_dir
+                .join(entry.path().file_name().unwrap())
+                .with_extension("json");
+
+            std::fs::write(output_dir, output_content)?;
+        }
     } else {
-        println!("{}", output_content)
+        let output_content = compile_entry(&args, &args.input)?;
+        if let Some(output) = args.output {
+            std::fs::write(output, output_content)?;
+        } else {
+            println!("{}", output_content);
+        }
     }
 
     Ok(())
