@@ -192,7 +192,7 @@ impl View {
     /// the element width.
     pub fn element_offset(&self, byte_offset: u32) -> Result<u32> {
         let width = self.element_width()?;
-        if byte_offset % width != 0 {
+        if !byte_offset.is_multiple_of(width) {
             return Err(eyre!(
                 "offset {byte_offset} in `{}` is not a multiple of the {width}-byte element size",
                 self.name

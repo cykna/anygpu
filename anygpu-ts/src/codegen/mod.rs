@@ -34,7 +34,7 @@ impl<'a> TypeScriptBuilder<'a> {
         let registry = collect(schema)?;
 
         let mut code = CodeBuilder::new();
-        code.emit_views(&registry);
+        code.emit_views(&registry)?;
         for view in registry.structs() {
             code.emit_struct(view)?;
         }
@@ -73,10 +73,10 @@ mod tests {
         }
     }
 
-    fn example_schema() -> ShaderBindings {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../examples/init.json");
-        let json = std::fs::read_to_string(path).expect("examples/init.json should be readable");
-        serde_json::from_str(&json).expect("examples/init.json should parse")
+    fn camera_schema() -> ShaderBindings {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/camera.json");
+        let json = std::fs::read_to_string(path).expect("fixtures/camera.json should be readable");
+        serde_json::from_str(&json).expect("fixtures/camera.json should parse")
     }
 
     fn struct_view(schema: &ShaderBindings, name: &str) -> View {
@@ -95,107 +95,72 @@ mod tests {
     }
 
     #[test]
-    fn views_carry_layout_for_buffer_slicing() {
-        let schema = example_schema();
-        let camera = struct_view(&schema, "Camera");
-        assert_eq!(camera.ts_type().unwrap(), "Camera");
-        assert_eq!(camera.byte_size().unwrap(), 80);
+    fn byte_offsets_become_element_indices() {
+        let camera = struct_view(&camera_schema(), "Camera");
         assert_eq!(camera.storage().unwrap(), "Float32Array");
+        assert_eq!(camera.element_width().unwrap(), 4);
+        assert_eq!(camera.byte_size().unwrap(), 80);
+        assert_eq!(camera.element_count().unwrap(), 20);
+        assert_eq!(camera.element_offset(0).unwrap(), 0);
+        assert_eq!(camera.element_offset(16).unwrap(), 4);
 
-        let members = camera.as_struct().unwrap().members.clone();
-        let ranges: Vec<_> = members
-            .iter()
-            .map(|member| {
-                (
-                    member.name.as_str(),
-                    member.offset,
-                    member.offset + member.view.byte_size().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            ranges,
-            vec![("position", 0, 16), ("rot", 16, 80)],
-            "each member should resolve to its own byte range"
-        );
-        assert_eq!(members[0].view.ts_type().unwrap(), "Vector4f32");
-        assert_eq!(members[1].view.ts_type().unwrap(), "Mat4x4f32");
-    }
-
-    #[test]
-    fn views_read_out_leaves_in_memory_order() {
-        let schema = example_schema();
-        let camera = struct_view(&schema, "Camera");
         let members = &camera.as_struct().unwrap().members;
-        assert_eq!(
-            members[0].view.leaf_accessors("position").unwrap(),
-            ["position.x", "position.y", "position.z", "position.w"]
-        );
-        assert_eq!(
-            members[1].view.leaf_accessors("rot").unwrap()[..3],
-            ["rot.m00", "rot.m01", "rot.m02"]
+        assert_eq!(members[0].view.byte_size().unwrap(), 16);
+        assert_eq!(members[0].view.element_count().unwrap(), 4);
+        assert_eq!(members[1].view.byte_size().unwrap(), 64);
+        assert_eq!(members[1].view.element_count().unwrap(), 16);
+    }
+
+    #[test]
+    fn element_width_follows_the_scalar_kind() {
+        let ty = TypeInfo {
+            name: "vec2<f64>".to_string(),
+            descriptor: TypeDescriptor::Vector {
+                length: 2,
+                scalar: ScalarInfo {
+                    name: "float".to_string(),
+                    width: 8,
+                },
+            },
+        };
+        let view = View::build(&ty).unwrap();
+        assert_eq!(view.storage().unwrap(), "Float64Array");
+        assert_eq!(view.element_width().unwrap(), 8);
+        assert_eq!(view.element_offset(8).unwrap(), 1);
+    }
+
+    #[test]
+    fn offsets_that_are_not_whole_elements_are_rejected() {
+        let camera = struct_view(&camera_schema(), "Camera");
+        let err = camera.element_offset(2).unwrap_err().to_string();
+        assert!(
+            err.contains("not a multiple of the 4-byte element"),
+            "{err}"
         );
     }
 
     #[test]
-    fn nested_structs_and_arrays_recurse() {
-        let inner = TypeInfo {
-            name: "Inner".to_string(),
-            descriptor: TypeDescriptor::Struct {
-                size: 8,
-                alignment: 4,
-                members: vec![
-                    MemberDescriptor {
-                        name: "a".to_string(),
-                        offset: 0,
-                        ty: Box::new(TypeInfo {
-                            name: "f32".to_string(),
-                            descriptor: TypeDescriptor::Scalar { scalar: f32() },
-                        }),
-                    },
-                    MemberDescriptor {
-                        name: "b".to_string(),
-                        offset: 4,
-                        ty: Box::new(TypeInfo {
-                            name: "i32".to_string(),
-                            descriptor: TypeDescriptor::Scalar { scalar: i32() },
-                        }),
-                    },
-                ],
-            },
-        };
-        let outer = TypeInfo {
-            name: "Outer".to_string(),
-            descriptor: TypeDescriptor::Struct {
-                size: 32,
-                alignment: 16,
-                members: vec![MemberDescriptor {
-                    name: "items".to_string(),
-                    offset: 0,
-                    ty: Box::new(TypeInfo {
-                        name: "array<Inner, 2>".to_string(),
-                        descriptor: TypeDescriptor::Array {
-                            base: Box::new(inner),
-                            size: Some(2),
-                            stride: 16,
-                        },
-                    }),
-                }],
-            },
-        };
+    fn mixed_scalar_storage_is_rejected() {
+        let view = View::build(&mixed_scalar_struct()).unwrap();
+        let err = view.storage().unwrap_err().to_string();
+        assert!(err.contains("cannot share one buffer"), "{err}");
+    }
 
-        let view = View::build(&outer).unwrap();
-        let items = &view.as_struct().unwrap().members[0].view;
-        assert_eq!(items.ts_type().unwrap(), "Array<Inner, 2>");
-        assert_eq!(items.byte_size().unwrap(), 32);
-        assert_eq!(
-            items.leaf_accessors("items").unwrap(),
-            ["items[0].a", "items[0].b", "items[1].a", "items[1].b"]
+    #[test]
+    fn array_members_report_an_error_instead_of_panicking() {
+        let view = View::build(&array_member_struct()).unwrap();
+        let typescript = TypeScriptBuilder::new()
+            .schema(&ShaderBindings {
+                types: vec![array_member_struct()],
+            })
+            .build()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            typescript.contains("cannot be exposed as a view yet"),
+            "{typescript}"
         );
-
-        let err = items.storage().unwrap_err();
-        assert!(err.to_string().contains("cannot share one buffer"), "{err}");
-        assert_eq!(view.scalar_widths().into_iter().collect::<Vec<_>>(), [4]);
+        let _ = view;
     }
 
     #[test]
@@ -224,28 +189,124 @@ mod tests {
 
     #[test]
     fn output_is_stable_and_scalar_keyed() {
-        let schema = example_schema();
+        let schema = camera_schema();
         let typescript = TypeScriptBuilder::new().schema(&schema).build().unwrap();
-        assert_eq!(
-            typescript,
-            concat!(
-                "export interface Vector4f32 { x: number, y: number, z: number, w: number }\n",
-                "export interface Mat4x4f32 {\n",
-                "  m00: number; m01: number; m02: number; m03: number;\n",
-                "  m10: number; m11: number; m12: number; m13: number;\n",
-                "  m20: number; m21: number; m22: number; m23: number;\n",
-                "  m30: number; m31: number; m32: number; m33: number;\n",
-                "}\n",
-                "\n",
-                "export class Camera {\n",
-                "  position: Float32Array;\n",
-                "  rot: Float32Array;\n",
-                "  constructor(position: Vector4f32, rot: Mat4x4f32) {\n",
-                "    this.position = new Float32Array([position.x, position.y, position.z, position.w]);\n",
-                "    this.rot = new Float32Array([rot.m00, rot.m01, rot.m02, rot.m03, rot.m10, rot.m11, rot.m12, rot.m13, rot.m20, rot.m21, rot.m22, rot.m23, rot.m30, rot.m31, rot.m32, rot.m33]);\n",
-                "  }\n",
-                "}\n",
-            )
+
+        let expected = concat!(
+            "export class Vector4f32 {\n",
+            "  buffer: Float32Array;\n",
+            "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  get x(): number { return this.buffer[0]; }\n",
+            "  set x(v: number) { this.buffer[0] = v; }\n",
+            "  get y(): number { return this.buffer[1]; }\n",
+            "  set y(v: number) { this.buffer[1] = v; }\n",
+            "  get z(): number { return this.buffer[2]; }\n",
+            "  set z(v: number) { this.buffer[2] = v; }\n",
+            "  get w(): number { return this.buffer[3]; }\n",
+            "  set w(v: number) { this.buffer[3] = v; }\n",
+            "}\n",
+            "\n",
+            "export class Mat4x4f32 {\n",
+            "  buffer: Float32Array;\n",
+            "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  get m00(): number { return this.buffer[0]; }\n",
+            "  set m00(v: number) { this.buffer[0] = v; }\n",
+            "  get m01(): number { return this.buffer[1]; }\n",
+            "  set m01(v: number) { this.buffer[1] = v; }\n",
+            "  get m02(): number { return this.buffer[2]; }\n",
+            "  set m02(v: number) { this.buffer[2] = v; }\n",
+            "  get m03(): number { return this.buffer[3]; }\n",
+            "  set m03(v: number) { this.buffer[3] = v; }\n",
+            "  get m10(): number { return this.buffer[4]; }\n",
+            "  set m10(v: number) { this.buffer[4] = v; }\n",
+            "  get m11(): number { return this.buffer[5]; }\n",
+            "  set m11(v: number) { this.buffer[5] = v; }\n",
+            "  get m12(): number { return this.buffer[6]; }\n",
+            "  set m12(v: number) { this.buffer[6] = v; }\n",
+            "  get m13(): number { return this.buffer[7]; }\n",
+            "  set m13(v: number) { this.buffer[7] = v; }\n",
+            "  get m20(): number { return this.buffer[8]; }\n",
+            "  set m20(v: number) { this.buffer[8] = v; }\n",
+            "  get m21(): number { return this.buffer[9]; }\n",
+            "  set m21(v: number) { this.buffer[9] = v; }\n",
+            "  get m22(): number { return this.buffer[10]; }\n",
+            "  set m22(v: number) { this.buffer[10] = v; }\n",
+            "  get m23(): number { return this.buffer[11]; }\n",
+            "  set m23(v: number) { this.buffer[11] = v; }\n",
+            "  get m30(): number { return this.buffer[12]; }\n",
+            "  set m30(v: number) { this.buffer[12] = v; }\n",
+            "  get m31(): number { return this.buffer[13]; }\n",
+            "  set m31(v: number) { this.buffer[13] = v; }\n",
+            "  get m32(): number { return this.buffer[14]; }\n",
+            "  set m32(v: number) { this.buffer[14] = v; }\n",
+            "  get m33(): number { return this.buffer[15]; }\n",
+            "  set m33(v: number) { this.buffer[15] = v; }\n",
+            "}\n",
+            "\n",
+            "export class Camera {\n",
+            "  buffer: Float32Array;\n",
+            "  get position(): Vector4f32 { return new Vector4f32(this.buffer.subarray(0, 4)); }\n",
+            "  get rot(): Mat4x4f32 { return new Mat4x4f32(this.buffer.subarray(4, 20)); }\n",
+            "  constructor(position: Vector4f32, rot: Mat4x4f32) {\n",
+            "    this.buffer = new Float32Array(20); // 80 bytes / 4\n",
+            "    this.buffer.set(position.buffer, 0); // offset 0 bytes / 4 = 0\n",
+            "    this.buffer.set(rot.buffer, 4); // offset 16 bytes / 4 = 4\n",
+            "  }\n",
+            "}\n",
         );
+        assert_eq!(typescript, expected);
+    }
+
+    fn mixed_scalar_struct() -> TypeInfo {
+        scalar_struct("Mixed", vec![("a", 0, f32()), ("b", 4, i32())])
+    }
+
+    fn array_member_struct() -> TypeInfo {
+        TypeInfo {
+            name: "WithArray".to_string(),
+            descriptor: TypeDescriptor::Struct {
+                size: 16,
+                alignment: 16,
+                members: vec![MemberDescriptor {
+                    name: "items".to_string(),
+                    offset: 0,
+                    ty: Box::new(TypeInfo {
+                        name: "array<vec4<f32>, 1>".to_string(),
+                        descriptor: TypeDescriptor::Array {
+                            base: Box::new(TypeInfo {
+                                name: "vec4<f32>".to_string(),
+                                descriptor: TypeDescriptor::Vector {
+                                    length: 4,
+                                    scalar: f32(),
+                                },
+                            }),
+                            size: Some(1),
+                            stride: 16,
+                        },
+                    }),
+                }],
+            },
+        }
+    }
+
+    fn scalar_struct(name: &str, members: Vec<(&str, u32, ScalarInfo)>) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            descriptor: TypeDescriptor::Struct {
+                size: 16,
+                alignment: 16,
+                members: members
+                    .into_iter()
+                    .map(|(name, offset, scalar)| MemberDescriptor {
+                        name: name.to_string(),
+                        offset,
+                        ty: Box::new(TypeInfo {
+                            name: scalar.name.clone(),
+                            descriptor: TypeDescriptor::Scalar { scalar },
+                        }),
+                    })
+                    .collect(),
+            },
+        }
     }
 }
