@@ -54,10 +54,13 @@ fn collect(schema: &ShaderBindings) -> Result<Registry> {
 #[cfg(test)]
 mod tests {
     use anygpu::{
-        MemberDescriptor, ScalarInfo, ShaderBindings, TypeDescriptor, TypeInfo, serde_json,
+        ImageClass, ImageDimension, MemberDescriptor, ScalarInfo, ShaderBindings, TypeDescriptor,
+        TypeInfo, serde_json,
     };
 
     use super::*;
+    use crate::codegen::emit::{Access, member_access};
+    use crate::codegen::view::ViewKind;
 
     fn f32() -> ScalarInfo {
         ScalarInfo {
@@ -147,11 +150,144 @@ mod tests {
     }
 
     #[test]
-    fn array_members_report_an_error_instead_of_panicking() {
-        let view = View::build(&array_member_struct()).unwrap();
+    fn array_members_get_a_deduplicated_accessor_class() {
+        let schema = ShaderBindings {
+            types: vec![array_member_struct()],
+        };
+        let view = struct_view(&schema, "Lights");
+        let members = &view.as_struct().unwrap().members;
+
+        // The stride reaches TypeScript in elements, not bytes.
+        let access = member_access(&view, &members[0]).unwrap();
+        assert_eq!(
+            access,
+            Access::Array {
+                start: 0,
+                stride: 4,
+                count: Some(4)
+            }
+        );
+        assert_eq!(members[0].view.ts_type().unwrap(), "LightArray");
+
+        let typescript = TypeScriptBuilder::new().schema(&schema).build().unwrap();
+        assert_eq!(
+            typescript.matches("export class LightArray").count(),
+            1,
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("stride: number; // em elementos"),
+            "{typescript}"
+        );
+        assert!(
+            typescript
+                .contains("get length(): number { return this.buffer.length / this.stride; }")
+        );
+        // A fixed array is clipped to its own count.
+        assert!(
+            typescript.contains(
+                "get items(): LightArray { return new LightArray(this.buffer.subarray(0, 16), 4); }"
+            ),
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("this.buffer = new Float32Array(16); // 64 bytes / 4"),
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("this.buffer.set(items.buffer, 0);"),
+            "{typescript}"
+        );
+        // An array of structs needs the `.view` factory: a struct cannot be built
+        // from a buffer with `new`, since it takes its members.
+        assert!(
+            typescript
+                .contains("return Light.view(this.buffer.subarray(start, start + this.stride));"),
+            "{typescript}"
+        );
+    }
+
+    #[test]
+    fn runtime_sized_arrays_extend_the_allocation() {
+        let schema = ShaderBindings {
+            types: vec![runtime_array_struct()],
+        };
+        let view = struct_view(&schema, "Particles");
+        let members = &view.as_struct().unwrap().members;
+
+        // No count in the schema, so the view is left unbounded.
+        assert_eq!(
+            member_access(&view, &members[0]).unwrap(),
+            Access::Array {
+                start: 0,
+                stride: 4,
+                count: None
+            }
+        );
+
+        let typescript = TypeScriptBuilder::new().schema(&schema).build().unwrap();
+        assert!(
+            typescript.contains("get data(): Vector4f32Array { return new Vector4f32Array(this.buffer.subarray(0), 4); }"),
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("this.buffer = new Float32Array(Math.max(4, data.buffer.length));"),
+            "{typescript}"
+        );
+    }
+
+    #[test]
+    fn structs_can_be_built_over_a_foreign_buffer() {
+        let typescript = TypeScriptBuilder::new()
+            .schema(&camera_schema())
+            .build()
+            .unwrap();
+        // A struct getter used to emit `new X(subarray)`, which cannot compile:
+        // the struct constructor allocates from its members instead.
+        assert!(
+            typescript.contains(
+                "get position(): Vector4f32 { return Vector4f32.view(this.buffer.subarray(0, 4)); }"
+            ),
+            "{typescript}"
+        );
+        assert!(
+            typescript.contains("static view(buffer: Float32Array): Vector4f32 {"),
+            "{typescript}"
+        );
+    }
+
+    #[test]
+    fn opaque_types_cannot_be_struct_members() {
+        let struct_with_sampler = TypeInfo {
+            name: "Bad".to_string(),
+            descriptor: TypeDescriptor::Struct {
+                size: 8,
+                alignment: 4,
+                // A scalar member is needed so the struct resolves its backing
+                // storage and the failure lands on the opaque member instead.
+                members: vec![
+                    MemberDescriptor {
+                        name: "count".to_string(),
+                        offset: 0,
+                        ty: Box::new(TypeInfo {
+                            name: "f32".to_string(),
+                            descriptor: TypeDescriptor::Scalar { scalar: f32() },
+                        }),
+                    },
+                    MemberDescriptor {
+                        name: "tex".to_string(),
+                        offset: 4,
+                        ty: Box::new(TypeInfo {
+                            name: "sampler".to_string(),
+                            descriptor: TypeDescriptor::Sampler { comparison: false },
+                        }),
+                    },
+                ],
+            },
+        };
         let typescript = TypeScriptBuilder::new()
             .schema(&ShaderBindings {
-                types: vec![array_member_struct()],
+                types: vec![struct_with_sampler],
             })
             .build()
             .unwrap_err()
@@ -160,17 +296,32 @@ mod tests {
             typescript.contains("cannot be exposed as a view yet"),
             "{typescript}"
         );
-        let _ = view;
     }
 
     #[test]
-    fn unsupported_descriptors_error_instead_of_panicking() {
-        let ty = TypeInfo {
-            name: "texture".to_string(),
-            descriptor: TypeDescriptor::Image,
-        };
-        let err = View::build(&ty).unwrap_err().to_string();
-        assert!(err.contains("no view representation"), "{err}");
+    fn opaque_descriptors_build_as_opaque_views() {
+        // Images and samplers have no buffer representation yet, but they are
+        // recognised so that using one *inside a struct* reports a clear error
+        // instead of panicking.
+        for (descriptor, tsname) in [
+            (
+                TypeDescriptor::Image {
+                    dimension: ImageDimension::D2,
+                    arrayed: false,
+                    class: ImageClass::External,
+                },
+                "GPUImage",
+            ),
+            (TypeDescriptor::Sampler { comparison: false }, "GPUSampler"),
+        ] {
+            let view = View::build(&TypeInfo {
+                name: "texture".to_string(),
+                descriptor,
+            })
+            .unwrap();
+            assert!(matches!(view.kind, ViewKind::Opaque { .. }), "{view:?}");
+            assert_eq!(view.ts_type().unwrap(), tsname);
+        }
     }
 
     #[test]
@@ -196,6 +347,7 @@ mod tests {
             "export class Vector4f32 {\n",
             "  buffer: Float32Array;\n",
             "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  static view(buffer: Float32Array): Vector4f32 { const self = Object.create(Vector4f32.prototype) as Vector4f32; self.buffer = buffer; return self; }\n",
             "  get x(): number { return this.buffer[0]; }\n",
             "  set x(v: number) { this.buffer[0] = v; }\n",
             "  get y(): number { return this.buffer[1]; }\n",
@@ -209,6 +361,7 @@ mod tests {
             "export class Mat4x4f32 {\n",
             "  buffer: Float32Array;\n",
             "  constructor(buffer: Float32Array) { this.buffer = buffer; }\n",
+            "  static view(buffer: Float32Array): Mat4x4f32 { const self = Object.create(Mat4x4f32.prototype) as Mat4x4f32; self.buffer = buffer; return self; }\n",
             "  get m00(): number { return this.buffer[0]; }\n",
             "  set m00(v: number) { this.buffer[0] = v; }\n",
             "  get m01(): number { return this.buffer[1]; }\n",
@@ -244,9 +397,10 @@ mod tests {
             "}\n",
             "\n",
             "export class Camera {\n",
-            "  buffer: Float32Array;\n",
-            "  get position(): Vector4f32 { return new Vector4f32(this.buffer.subarray(0, 4)); }\n",
-            "  get rot(): Mat4x4f32 { return new Mat4x4f32(this.buffer.subarray(4, 20)); }\n",
+            "  public buffer: Float32Array;\n",
+            "  static view(buffer: Float32Array): Camera { const self = Object.create(Camera.prototype) as Camera; self.buffer = buffer; return self; }\n",
+            "  get position(): Vector4f32 { return Vector4f32.view(this.buffer.subarray(0, 4)); }\n",
+            "  get rot(): Mat4x4f32 { return Mat4x4f32.view(this.buffer.subarray(4, 20)); }\n",
             "  constructor(position: Vector4f32, rot: Mat4x4f32) {\n",
             "    this.buffer = new Float32Array(20); // 80 bytes / 4\n",
             "    this.buffer.set(position.buffer, 0); // offset 0 bytes / 4 = 0\n",
@@ -261,29 +415,85 @@ mod tests {
         scalar_struct("Mixed", vec![("a", 0, f32()), ("b", 4, i32())])
     }
 
-    fn array_member_struct() -> TypeInfo {
+    fn light_struct() -> TypeInfo {
         TypeInfo {
-            name: "WithArray".to_string(),
+            name: "Light".to_string(),
             descriptor: TypeDescriptor::Struct {
                 size: 16,
+                alignment: 16,
+                members: vec![
+                    MemberDescriptor {
+                        name: "color".to_string(),
+                        offset: 0,
+                        ty: Box::new(TypeInfo {
+                            name: "vec3<f32>".to_string(),
+                            descriptor: TypeDescriptor::Vector {
+                                length: 3,
+                                scalar: f32(),
+                            },
+                        }),
+                    },
+                    MemberDescriptor {
+                        name: "intensity".to_string(),
+                        offset: 12,
+                        ty: Box::new(TypeInfo {
+                            name: "f32".to_string(),
+                            descriptor: TypeDescriptor::Scalar { scalar: f32() },
+                        }),
+                    },
+                ],
+            },
+        }
+    }
+
+    fn array_of(base: TypeInfo, size: Option<u32>, name: &str) -> TypeInfo {
+        TypeInfo {
+            name: name.to_string(),
+            descriptor: TypeDescriptor::Array {
+                base: Box::new(base),
+                size,
+                stride: 16,
+            },
+        }
+    }
+
+    /// `struct Lights { items: array<Light, 4> }`
+    fn array_member_struct() -> TypeInfo {
+        TypeInfo {
+            name: "Lights".to_string(),
+            descriptor: TypeDescriptor::Struct {
+                size: 64,
                 alignment: 16,
                 members: vec![MemberDescriptor {
                     name: "items".to_string(),
                     offset: 0,
-                    ty: Box::new(TypeInfo {
-                        name: "array<vec4<f32>, 1>".to_string(),
-                        descriptor: TypeDescriptor::Array {
-                            base: Box::new(TypeInfo {
-                                name: "vec4<f32>".to_string(),
-                                descriptor: TypeDescriptor::Vector {
-                                    length: 4,
-                                    scalar: f32(),
-                                },
-                            }),
-                            size: Some(1),
-                            stride: 16,
+                    ty: Box::new(array_of(light_struct(), Some(4), "array<Light, 4>")),
+                }],
+            },
+        }
+    }
+
+    /// `struct Particles { data: array<vec4<f32>> }`, sized at runtime.
+    fn runtime_array_struct() -> TypeInfo {
+        TypeInfo {
+            name: "Particles".to_string(),
+            descriptor: TypeDescriptor::Struct {
+                size: 16,
+                alignment: 16,
+                members: vec![MemberDescriptor {
+                    name: "data".to_string(),
+                    offset: 0,
+                    ty: Box::new(array_of(
+                        TypeInfo {
+                            name: "vec4<f32>".to_string(),
+                            descriptor: TypeDescriptor::Vector {
+                                length: 4,
+                                scalar: f32(),
+                            },
                         },
-                    }),
+                        None,
+                        "array<vec4<f32>>",
+                    )),
                 }],
             },
         }

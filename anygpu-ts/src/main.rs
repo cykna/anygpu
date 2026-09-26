@@ -1,12 +1,10 @@
-mod codegen;
-
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use color_eyre::{Result, eyre::WrapErr};
 
-use crate::codegen::generate_typescript;
+use anygpu_gen_ts::codegen::generate_typescript;
 
 #[derive(Parser)]
 #[command(version, about)]

@@ -54,6 +54,9 @@ pub enum ViewKind {
     },
     Atomic(ScalarLayout),
     Struct(StructView),
+    Opaque {
+        tsname: &'static str,
+    },
 }
 
 #[allow(dead_code)]
@@ -124,6 +127,10 @@ impl View {
                     })
                     .collect::<Result<Vec<_>>>()?,
             }),
+            TypeDescriptor::Sampler { .. } => ViewKind::Opaque {
+                tsname: "GPUSampler",
+            },
+            TypeDescriptor::Image { .. } => ViewKind::Opaque { tsname: "GPUImage" },
             other => {
                 return Err(eyre!(
                     "`{}` has descriptor {other:?}, which has no view representation",
@@ -161,6 +168,7 @@ impl View {
                 stride * size
             }
             ViewKind::Struct(view) => view.size,
+            ViewKind::Opaque { .. } => 0,
         })
     }
 
@@ -213,14 +221,9 @@ impl View {
                 rows,
                 scalar,
             } => format!("Mat{columns}x{rows}{}", scalar.suffix),
-            ViewKind::Array { size, element, .. } => {
-                let element = element.ts_type()?;
-                match size {
-                    Some(size) => format!("Array<{element}, {size}>"),
-                    None => format!("Array<{element}>"),
-                }
-            }
+            ViewKind::Array { element, .. } => format!("{}Array", element.ts_type()?),
             ViewKind::Struct(_) => identifier(&self.name),
+            ViewKind::Opaque { tsname } => tsname.to_string(),
         })
     }
 
@@ -239,8 +242,20 @@ impl View {
             } => {
                 registry.add_matrix(*columns, *rows, *scalar);
             }
-            ViewKind::Array { element, .. } => element.register(registry)?,
-            ViewKind::Struct(_) => registry.add_struct(self.clone()),
+            ViewKind::Array { element, .. } => {
+                element.register(registry)?;
+                registry.add_array(self.ts_type()?, element.as_ref().clone());
+            }
+            ViewKind::Struct(view) => {
+                // Members are registered too, so an array or a vector that only
+                // ever appears inside a struct still gets its class emitted,
+                // whatever the schema happens to list at the top level.
+                for member in &view.members {
+                    member.view.register(registry)?;
+                }
+                registry.add_struct(self.clone());
+            }
+            ViewKind::Opaque { .. } => {}
         }
         Ok(())
     }
@@ -260,6 +275,7 @@ impl View {
                 }
                 Ok(())
             }
+            ViewKind::Opaque { .. } => Ok(()),
         }
     }
 
@@ -279,6 +295,7 @@ impl View {
                 .iter()
                 .flat_map(|member| member.view.scalar_widths())
                 .collect(),
+            ViewKind::Opaque { .. } => BTreeSet::new(),
         }
     }
 }
