@@ -379,3 +379,69 @@ pub fn identifier(raw: &str) -> String {
     }
     out
 }
+
+/// The file stem a shared class is written to, in `snake_case`.
+///
+/// `Vector3f32` becomes `vector3f32`, `Mat4x4f32` becomes `mat4x4f32` and
+/// `Vector4f32Array` becomes `vector4f32_array`. The `Array` suffix is the one
+/// part of a class name that reads as a word — the digits and the `x` in a
+/// matrix are part of the name itself — so it is the one part that gets a
+/// separator of its own.
+pub fn builtin_module(class: &str) -> String {
+    let base = class.strip_suffix("Array").unwrap_or(class);
+    let mut out = String::with_capacity(base.len() + 6);
+    for (index, ch) in base.chars().enumerate() {
+        if index > 0 && ch.is_ascii_uppercase() {
+            out.push('_');
+        }
+        out.push(ch.to_ascii_lowercase());
+    }
+    if base.len() < class.len() {
+        out.push_str("_array");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::builtin_module;
+
+    #[test]
+    fn a_shared_class_is_written_to_a_snake_case_file() {
+        // The digits and the `x` of a matrix are part of the name, so they stay
+        // attached to it.
+        assert_eq!(builtin_module("Vector3f32"), "vector3f32");
+        assert_eq!(builtin_module("Vector2f64"), "vector2f64");
+        assert_eq!(builtin_module("Mat4x4f32"), "mat4x4f32");
+        assert_eq!(builtin_module("Mat2x2i32"), "mat2x2i32");
+        // `Array` is the one part that reads as a word, so it gets its separator.
+        assert_eq!(builtin_module("Vector4f32Array"), "vector4f32_array");
+        assert_eq!(builtin_module("LightArray"), "light_array");
+        // A class name is always `<element>Array` with a non-empty element, so
+        // there is no bare `Array` to name a file after.
+        assert_eq!(builtin_module(""), "");
+    }
+
+    #[test]
+    fn two_classes_never_land_in_the_same_file() {
+        // The stem has to be one to one, or one class would overwrite the other.
+        let classes = [
+            "Vector3f32",
+            "Vector4f32",
+            "Vector3f32Array",
+            "Vector4f32Array",
+            "Mat4x4f32",
+            "Light",
+            "LightArray",
+        ];
+        let mut stems: Vec<String> = classes.iter().map(|c| builtin_module(c)).collect();
+        stems.sort();
+        let count = stems.len();
+        stems.dedup();
+        assert_eq!(
+            stems.len(),
+            count,
+            "two classes share a file stem: {stems:?}"
+        );
+    }
+}

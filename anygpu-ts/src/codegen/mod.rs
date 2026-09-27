@@ -5,20 +5,186 @@ mod registry;
 mod scalar;
 mod view;
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
 use color_eyre::eyre::{Result, eyre};
 
-use crate::codegen::emit::CodeBuilder;
+use crate::codegen::descriptors::ClassDescriptor;
+use crate::codegen::emit::{
+    CodeBuilder, builtin_classes, emit_class, emit_class_all, shader_classes,
+};
 use crate::codegen::registry::Registry;
-use crate::codegen::view::Views;
+use crate::codegen::view::{Views, builtin_module};
 use anygpu::ShaderBindings;
+
+/// The file the support section takes inside the output folder.
+const SUPPORT_PATH: &str = "support.ts";
+
+/// The folder the shared accessor classes are written to.
+const BUILTINS_DIR: &str = "builtins";
 
 /// Generates the TypeScript for one shader.
 ///
 /// `name` is the shader's own name, taken from the file it came from: it is what
 /// the pipeline helper is exported under, since the schema itself has nowhere to
 /// record a name.
+///
+/// The result is self-contained: it carries the support section and every shared
+/// class inline, so a file written from it compiles on its own. Generating a
+/// whole folder instead spreads the same declarations over `support.ts` and
+/// `builtins/`, which is what [`generate_batch`] does.
 pub fn generate_typescript(schema: &ShaderBindings, name: &str) -> Result<String> {
     TypeScriptBuilder::new().schema(schema).shader(name).build()
+}
+
+/// One file a batch produces, named by the path it takes inside the output
+/// folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFile {
+    /// Relative to the output folder, e.g. `support.ts`, `builtins/mat4x4f32.ts`
+    /// or `camera.ts`.
+    pub path: PathBuf,
+    pub contents: String,
+}
+
+/// Generates every file one run over a folder of schemas produces.
+///
+/// A batch is one execution of the command over a whole folder, and the output
+/// is split three ways:
+///
+/// - `support.ts`, once per batch. It does not depend on any schema, so it is
+///   written from the one checked-in copy of the support section.
+/// - `builtins/<class>.ts`, one per shared accessor class, written once per
+///   batch however many shaders use it. A class is shareable when nothing about
+///   it is shader-specific: every `vec3<f32>` in the folder wants the same
+///   `Vector3f32`.
+/// - `<shader>.ts`, one per shader exactly as before, carrying only what is
+///   specific to it: its own structs, the arrays over those structs, and its
+///   pipeline instance. Everything shared is imported instead.
+///
+/// Every run rebuilds the whole set from scratch, so pointing a second run at the
+/// same folder overwrites what the first wrote and changes nothing else.
+pub fn generate_batch<'a>(
+    shaders: impl IntoIterator<Item = (&'a str, &'a ShaderBindings)>,
+) -> Result<Vec<BatchFile>> {
+    let shaders: Vec<(&str, &ShaderBindings)> = shaders.into_iter().collect();
+
+    // The shared classes are collected across the whole batch before anything is
+    // written, so each is written once and a shader can import exactly what the
+    // batch needs rather than what it happened to be processed before.
+    let mut builtins: BTreeMap<String, ClassDescriptor> = BTreeMap::new();
+    let mut collected = Vec::with_capacity(shaders.len());
+    for (name, schema) in &shaders {
+        let registry = collect(schema)?;
+        for class in builtin_classes(&registry)? {
+            // Keyed by name, which is enough: a vector, a matrix and an array of
+            // primitives are each fully determined by the class name they are
+            // given, so the same name is always the same class.
+            builtins.entry(class.name.clone()).or_insert(class);
+        }
+        collected.push((*name, schema, registry));
+    }
+    let shared: BTreeSet<&str> = builtins.keys().map(String::as_str).collect();
+
+    // A folder with no schema in it still gets the support section: it does not
+    // depend on any schema, and a caller asking for a batch of nothing is asking
+    // for the part that holds for any batch.
+    let mut files = vec![BatchFile {
+        path: PathBuf::from(SUPPORT_PATH),
+        contents: pipeline::SUPPORT.to_string(),
+    }];
+    for class in builtins.values() {
+        files.push(BatchFile {
+            path: PathBuf::from(BUILTINS_DIR).join(format!("{}.ts", builtin_module(&class.name))),
+            contents: builtin_file(class, &shared)?,
+        });
+    }
+    for (name, schema, registry) in collected {
+        files.push(BatchFile {
+            path: PathBuf::from(format!("{name}.ts")),
+            contents: shader_file(name, schema, &registry, &shared)?,
+        });
+    }
+    Ok(files)
+}
+
+/// A shared class's own file, with the siblings of `builtins/` it names.
+///
+/// Every file the batch writes sits at most one folder deep and imports only
+/// from its own folder, so a specifier is always `./<module>`.
+fn builtin_file(class: &ClassDescriptor, shared: &BTreeSet<&str>) -> Result<String> {
+    let mut code = CodeBuilder::new();
+    for name in shared_dependencies(std::slice::from_ref(class), shared) {
+        code.line(&format!(
+            "import {{ {name} }} from \"./{}\";",
+            builtin_module(name)
+        ));
+    }
+    emit_class(&mut code, class)?;
+    Ok(code.build())
+}
+
+/// One shader's file: its own structs, the arrays over them, and the pipeline
+/// instance its schema described — importing the support symbols and the shared
+/// classes that content names.
+fn shader_file(
+    name: &str,
+    schema: &ShaderBindings,
+    registry: &Registry,
+    shared: &BTreeSet<&str>,
+) -> Result<String> {
+    let classes = shader_classes(registry)?;
+    let mut code = CodeBuilder::new();
+
+    // Collected into a set of whole import lines, so the same folder always
+    // generates the same files in the same order.
+    let mut modules: BTreeSet<String> = BTreeSet::new();
+    for name in shared_dependencies(&classes, shared) {
+        modules.insert(format!(
+            "import {{ {name} }} from \"./builtins/{}\";",
+            builtin_module(name)
+        ));
+    }
+    if let Some(pipeline) = &schema.pipelines {
+        let names: Vec<&str> = pipeline::support_symbols(pipeline).into_iter().collect();
+        modules.insert(format!(
+            "import {{ {} }} from \"./support\";",
+            names.join(", ")
+        ));
+    }
+    // The blank line after the imports is left to whatever comes next: both the
+    // pipeline instance and every class open with one, and `CodeBuilder` drops it
+    // on a file with nothing in it yet.
+    for line in &modules {
+        code.line(line);
+    }
+
+    if let Some(pipeline) = &schema.pipelines {
+        pipeline::emit_shader(&mut code, name, pipeline)?;
+    }
+    emit_class_all(&mut code, &classes)?;
+    Ok(code.build())
+}
+
+/// The shared classes a group of classes names from another file.
+///
+/// A name outside `shared` is declared in the same file — a struct the shader
+/// declares for itself, or a scalar — and needs no import. A class never names
+/// itself.
+fn shared_dependencies<'a>(
+    classes: &'a [ClassDescriptor],
+    shared: &BTreeSet<&str>,
+) -> Vec<&'a str> {
+    let mut names: BTreeSet<&'a str> = BTreeSet::new();
+    for class in classes {
+        for dep in &class.deps {
+            if dep != &class.name && shared.contains(dep.as_str()) {
+                names.insert(dep.as_str());
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +227,7 @@ impl<'a> TypeScriptBuilder<'a> {
                 .ok_or_else(|| eyre!("no shader name was provided for its pipeline helper"))?;
             code.emit_shader_pipeline(name, pipelines)?;
         }
-        code.emit_views(&registry)?;
+        code.emit_accessor_classes(&registry)?;
         for view in registry.structs() {
             code.emit_struct(view)?;
         }
@@ -712,5 +878,387 @@ var<uniform> camera: Camera;
         // The pipeline block sits in front of the classes, so the type classes keep
         // comparing exactly as they did.
         assert!(typescript.ends_with(expected), "{typescript}");
+    }
+}
+
+/// The batch half of the generator: the same declarations, spread over a folder.
+///
+/// A single schema generates one self-contained file. A folder generates a
+/// `support.ts`, one file per shared accessor class, and one file per shader
+/// that imports the first two instead of repeating them.
+#[cfg(test)]
+mod batch {
+    use std::path::Path;
+
+    use anygpu::{ShaderMetadata, naga};
+
+    use super::*;
+
+    /// `struct Light { color: vec3<f32>, intensity: f32 }`
+    const LIGHTS_WGSL: &str = r"
+struct Light {
+    color: vec3<f32>,
+    intensity: f32,
+}
+struct Lights {
+    items: array<Light, 4>,
+}
+@group(0) @binding(0) var<storage, read> lights: Lights;
+";
+
+    /// `struct Camera { position: vec4<f32>, rot: mat4x4<f32> }`
+    const CAMERA_WGSL: &str = r"
+struct Camera {
+    position: vec4<f32>,
+    rot: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> camera: Camera;
+";
+
+    fn schema(wgsl: &str) -> ShaderBindings {
+        let module = naga::front::wgsl::parse_str(wgsl).expect("the shader should parse");
+        ShaderMetadata::new(&module)
+            .expect("the shader should expose bindings")
+            .generate_bindings()
+    }
+
+    /// The batch a set of shaders generates, keyed by its output path.
+    fn batch(named: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let schemas: Vec<(&str, ShaderBindings)> = named
+            .iter()
+            .map(|(name, wgsl)| (*name, schema(wgsl)))
+            .collect();
+        generate_batch(schemas.iter().map(|(name, schema)| (*name, schema)))
+            .expect("the batch should generate")
+            .into_iter()
+            .map(|file| (file.path.display().to_string(), file.contents))
+            .collect()
+    }
+
+    fn get<'a>(files: &'a BTreeMap<String, String>, path: &str) -> &'a str {
+        files
+            .get(path)
+            .unwrap_or_else(|| panic!("`{path}` should be in the batch: {:?}", files.keys()))
+    }
+
+    #[test]
+    fn the_support_section_is_written_once_for_the_whole_folder() {
+        let files = batch(&[("a", LIGHTS_WGSL), ("b", CAMERA_WGSL)]);
+
+        assert_eq!(
+            get(&files, "support.ts"),
+            crate::codegen::pipeline::SUPPORT,
+            "the batch writes the checked-in support section verbatim"
+        );
+        // Once, not once per shader.
+        assert_eq!(files.keys().filter(|path| *path == "support.ts").count(), 1);
+        // And no shader file repeats it.
+        for (path, contents) in &files {
+            if path.ends_with(".ts") && path != "support.ts" {
+                assert!(
+                    !contents.contains("export class PipelineHelper"),
+                    "`{path}` should import the support section, not repeat it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shared_class_is_written_once_however_many_shaders_use_it() {
+        // Both shaders use `vec3<f32>` and `vec4<f32>`, and only one uses a matrix.
+        let files = batch(&[("a", LIGHTS_WGSL), ("b", CAMERA_WGSL), ("c", LIGHTS_WGSL)]);
+
+        assert_eq!(
+            get(&files, "builtins/vector3f32.ts")
+                .matches("export class Vector3f32")
+                .count(),
+            1
+        );
+        // `vec4<f32>` is named by `Camera` here, but a matrix pulls in no vector.
+        assert!(files.contains_key("builtins/vector4f32.ts"));
+        assert!(files.contains_key("builtins/mat4x4f32.ts"));
+        // Three shaders, still one file each.
+        for path in ["builtins/vector3f32.ts", "builtins/vector4f32.ts"] {
+            assert_eq!(
+                files.keys().filter(|p| *p == path).count(),
+                1,
+                "`{path}` should be written once"
+            );
+        }
+        // No shader file declares a shared class any more.
+        for (path, contents) in &files {
+            if path == "a.ts" || path == "b.ts" || path == "c.ts" {
+                for shared in ["Vector3f32", "Vector4f32", "Mat4x4f32"] {
+                    assert!(
+                        !contents.contains(&format!("export class {shared}")),
+                        "`{path}` should not declare `{shared}`: {contents}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shader_file_imports_what_it_uses() {
+        let files = batch(&[("a", LIGHTS_WGSL), ("b", CAMERA_WGSL)]);
+
+        let a = get(&files, "a.ts");
+        assert!(
+            a.contains("import { Vector3f32 } from \"./builtins/vector3f32\";"),
+            "{a}"
+        );
+        // `a` has no matrix, so it does not import one.
+        assert!(!a.contains("mat4x4f32"), "{a}");
+        // Its own structs stay with it.
+        assert!(a.contains("export class Light {"), "{a}");
+        assert!(a.contains("export class Lights {"), "{a}");
+
+        let b = get(&files, "b.ts");
+        assert!(
+            b.contains("import { Vector4f32 } from \"./builtins/vector4f32\";"),
+            "{b}"
+        );
+        assert!(
+            b.contains("import { Mat4x4f32 } from \"./builtins/mat4x4f32\";"),
+            "{b}"
+        );
+        assert!(b.contains("export class Camera {"), "{b}");
+    }
+
+    #[test]
+    fn a_shared_array_imports_the_element_class() {
+        // `Particles.data: array<vec4<f32>>` makes a `Vector4f32Array` whose
+        // `get` returns a `Vector4f32` — a sibling, not the shader's own file.
+        let files = batch(&[("a", RUNTIME_ARRAY_WGSL)]);
+        let array = get(&files, "builtins/vector4f32_array.ts");
+
+        assert!(
+            array.contains("import { Vector4f32 } from \"./vector4f32\";"),
+            "{array}"
+        );
+        assert!(array.contains("export class Vector4f32Array {"), "{array}");
+        assert!(
+            array.contains("get(index: number): Vector4f32 {"),
+            "{array}"
+        );
+    }
+
+    const RUNTIME_ARRAY_WGSL: &str = r"
+struct Particles {
+    data: array<vec4<f32>>,
+}
+@group(0) @binding(0) var<storage, read> particles: Particles;
+";
+
+    #[test]
+    fn an_array_of_structs_stays_with_the_shader_that_declared_it() {
+        // `LightArray` is named after a struct, and a struct is per shader. The
+        // class and the type it names have to land in the same file, so neither
+        // one can be shared.
+        let files = batch(&[("a", LIGHTS_WGSL)]);
+
+        assert!(
+            !files.contains_key("builtins/light_array.ts"),
+            "{:?}",
+            files.keys()
+        );
+        let a = get(&files, "a.ts");
+        assert!(a.contains("export class LightArray {"), "{a}");
+        assert!(a.contains("get(index: number): Light {"), "{a}");
+        // `Light` is declared in this same file, so it is not imported.
+        assert!(!a.contains("light_array"), "{a}");
+    }
+
+    #[test]
+    fn two_shaders_may_declare_the_same_struct_name_differently() {
+        // Each shader wants a `LightArray`, but over its own `Light`. Sharing one
+        // would type one of them against the other's struct, so neither does.
+        let files = batch(&[("a", LIGHT_A_WGSL), ("b", LIGHT_B_WGSL)]);
+
+        assert!(
+            !files.contains_key("builtins/light_array.ts"),
+            "{:?}",
+            files.keys()
+        );
+        for name in ["a.ts", "b.ts"] {
+            let file = get(&files, name);
+            assert!(file.contains("export class LightArray {"), "{name}: {file}");
+            assert!(file.contains("export class Light {"), "{name}: {file}");
+        }
+        // The two `Light` classes are still each shader's own.
+        let a = get(&files, "a.ts");
+        let b = get(&files, "b.ts");
+        assert!(
+            a.contains("constructor(color: Vector3f32, intensity: number)"),
+            "{a}"
+        );
+        assert!(
+            b.contains("constructor(pos: Vector4f32, tint: Vector2f32)"),
+            "{b}"
+        );
+        // What the two have in common — a `vec4<f32>` — is still written once.
+        assert!(files.contains_key("builtins/vector4f32.ts"));
+    }
+
+    const LIGHT_A_WGSL: &str = r"
+struct Light {
+    color: vec3<f32>,
+    intensity: f32,
+}
+struct LightsA {
+    items: array<Light, 4>,
+}
+@group(0) @binding(0) var<uniform> lights: LightsA;
+";
+
+    const LIGHT_B_WGSL: &str = r"
+struct Light {
+    pos: vec4<f32>,
+    tint: vec2<f32>,
+}
+struct LightsB {
+    items: array<Light, 8>,
+}
+@group(0) @binding(0) var<uniform> lights: LightsB;
+";
+
+    #[test]
+    fn every_import_points_at_a_file_the_batch_wrote() {
+        let files = batch(&[("a", LIGHTS_WGSL), ("b", CAMERA_WGSL)]);
+
+        for (path, contents) in &files {
+            for line in contents.lines().filter(|line| line.starts_with("import ")) {
+                let specifier = line
+                    .rsplit_once("from \"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(specifier, _)| specifier)
+                    .unwrap_or_else(|| panic!("`{path}` has an unparsable import: {line}"));
+                // Every file is at most one folder deep, so the specifier is
+                // relative to the importing file's own folder. `Path::join` does
+                // not resolve the `./` the generator writes, so it goes first.
+                let relative = specifier.strip_prefix("./").unwrap_or(specifier);
+                let folder = Path::new(path).parent().unwrap_or(Path::new(""));
+                let target = folder.join(format!("{relative}.ts")).display().to_string();
+                assert!(
+                    files.contains_key(&target),
+                    "`{path}` imports `{specifier}`, which the batch never wrote: {:?}",
+                    files.keys()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_shader_file_names_the_support_it_uses() {
+        // The pipeline instance names `PipelineHelper`, so it is imported.
+        let files = batch(&[("a", LIGHTS_WGSL)]);
+        let a = get(&files, "a.ts");
+        assert!(
+            a.contains("export const APipelineHelper = new PipelineHelper({"),
+            "{a}"
+        );
+        assert!(
+            a.contains("import { PipelineHelper } from \"./support\";"),
+            "{a}"
+        );
+        // `LIGHTS_WGSL` resolves no stage, so every mask is a bare `0` and the
+        // stage flags are never named.
+        assert!(a.contains("visibility: 0"), "{a}");
+        assert!(!a.contains("AnygpuShaderStage"), "{a}");
+    }
+
+    #[test]
+    fn a_schema_with_no_pipeline_imports_no_helper() {
+        // `generate_bindings` always describes a pipeline, even for a shader with
+        // no entry points, so the pipeline is taken away to reach this case.
+        let mut bindings = schema(CAMERA_WGSL);
+        bindings.pipelines = None;
+        let files = generate_batch([("a", &bindings)]).expect("it should generate");
+        let a = &files
+            .iter()
+            .find(|file| file.path.ends_with("a.ts"))
+            .expect("`a.ts` should be written")
+            .contents;
+
+        assert!(!a.contains("PipelineHelper"), "{a}");
+        assert!(!a.contains("from \"./support\""), "{a}");
+        // It still has types, so it still imports the shared ones.
+        assert!(a.contains("export class Camera {"), "{a}");
+    }
+
+    #[test]
+    fn a_folder_of_no_schemas_still_gets_the_support_section() {
+        // The support section depends on no schema, so it is true of any batch.
+        let files = generate_batch(std::iter::empty()).expect("an empty batch should generate");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, PathBuf::from("support.ts"));
+        assert_eq!(files[0].contents, crate::codegen::pipeline::SUPPORT);
+    }
+
+    /// The text of `export class <name> { .. }` in a generated file.
+    ///
+    /// A generated class is a top-level declaration, so it ends at the first
+    /// line that is nothing but the closing brace. Whatever follows it — a blank
+    /// line, another class, the end of the file — is not part of it.
+    fn class_of(typescript: &str, name: &str) -> String {
+        let open = format!("export class {name} {{");
+        let start = typescript
+            .find(&open)
+            .unwrap_or_else(|| panic!("`{name}` should be declared in:\n{typescript}"));
+        let body = &typescript[start..];
+        let end = body
+            .lines()
+            .skip(1)
+            .position(|line| line == "}")
+            .map(|lines| lines + 2)
+            .unwrap_or_else(|| panic!("`{name}` should be closed in:\n{typescript}"));
+        body.lines().take(end).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn splitting_the_output_does_not_change_what_a_class_says() {
+        // The declarations are the same either way. Only the file each one lands
+        // in changes, so a class read out of a shared file has to match the same
+        // class read out of that shader's self-contained output, character for
+        // character.
+        let files = batch(&[("a", LIGHTS_WGSL), ("b", CAMERA_WGSL)]);
+        // Every class, and which file of the batch it moved to.
+        let expected: &[(&str, &str, &[&str])] = &[
+            (
+                "a",
+                LIGHTS_WGSL,
+                &["Vector3f32", "Light", "Lights", "LightArray"],
+            ),
+            ("b", CAMERA_WGSL, &["Vector4f32", "Mat4x4f32", "Camera"]),
+        ];
+
+        for (name, wgsl, classes) in expected {
+            let one = generate_typescript(&schema(wgsl), name).expect("it should generate");
+            let shader_file = get(&files, &format!("{name}.ts"));
+            for class in *classes {
+                let shared = files.contains_key(&format!(
+                    "builtins/{}.ts",
+                    super::view::builtin_module(class)
+                ));
+                // A class is either shared or the shader's own, never both and
+                // never neither.
+                assert_eq!(
+                    shared,
+                    !shader_file.contains(&format!("export class {class} {{")),
+                    "`{class}` should be in exactly one place"
+                );
+                let home = if shared {
+                    let path = format!("builtins/{}.ts", super::view::builtin_module(class));
+                    get(&files, &path)
+                } else {
+                    shader_file
+                };
+                assert_eq!(
+                    class_of(home, class),
+                    class_of(&one, class),
+                    "`{class}` should be declared exactly as it was inline"
+                );
+            }
+        }
     }
 }

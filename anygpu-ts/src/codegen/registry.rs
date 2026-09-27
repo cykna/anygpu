@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::codegen::scalar::ScalarLayout;
-use crate::codegen::view::{View, identifier};
+use crate::codegen::view::{View, ViewKind, identifier};
 
 /// The set of accessor types that need to be declared, deduplicated and in a
 /// stable order regardless of the order the schema listed them in.
@@ -45,6 +45,30 @@ impl Registry {
     /// Each registered array accessor class, paired with a view of its element.
     pub fn arrays(&self) -> impl Iterator<Item = (&String, &View)> {
         self.arrays.iter()
+    }
+
+    /// The array accessor classes a batch can share, paired with a view of the
+    /// element.
+    ///
+    /// An array is shareable when its element is not a struct. The class is then
+    /// named after the element's own accessor type and holds nothing but a
+    /// stride, so two shaders that both hold `array<vec3<f32>>` want the same
+    /// class, character for character. An array *of structs* is named after a
+    /// type each shader declares for itself, so it is not shareable: two shaders
+    /// can each have a differently shaped `Light` and still both want a
+    /// `LightArray` over it.
+    pub fn builtin_arrays(&self) -> impl Iterator<Item = (&String, &View)> {
+        self.arrays
+            .iter()
+            .filter(|(_, element)| !matches!(element.kind, ViewKind::Struct(_)))
+    }
+
+    /// The array accessor classes that stay in the shader that declared them,
+    /// each paired with a view of its struct element.
+    pub fn struct_arrays(&self) -> impl Iterator<Item = (&String, &View)> {
+        self.arrays
+            .iter()
+            .filter(|(_, element)| matches!(element.kind, ViewKind::Struct(_)))
     }
 
     pub fn structs(&self) -> impl Iterator<Item = &View> {

@@ -51,8 +51,9 @@ impl CodeBuilder {
         self.out
     }
 
-    pub fn emit_views(&mut self, registry: &Registry) -> Result<()> {
-        emit_views(self, registry)
+    /// Every accessor class the schema needs, for a file that carries them all.
+    pub fn emit_accessor_classes(&mut self, registry: &Registry) -> Result<()> {
+        emit_class_all(self, &accessor_classes(registry)?)
     }
 
     pub fn emit_struct(&mut self, view: &View) -> Result<()> {
@@ -81,7 +82,7 @@ impl CodeBuilder {
 /// code cannot drift between kinds. Members are emitted in one canonical
 /// order: the buffer field, extra fields, the constructor, the view factory,
 /// accessors, methods and finally getters.
-fn emit_class(code: &mut CodeBuilder, class: &ClassDescriptor) -> Result<()> {
+pub(crate) fn emit_class(code: &mut CodeBuilder, class: &ClassDescriptor) -> Result<()> {
     let name = &class.name;
 
     code.blank();
@@ -202,6 +203,7 @@ fn array_class(name: &str, base: &View) -> Result<ClassDescriptor> {
         .fields
         .push("stride: number; // em elementos".to_string());
     class.init.push("this.stride = stride;".to_string());
+    class.deps.push(base_name.clone());
     class.methods.push(Method {
         name: "get".to_string(),
         ty: Some(base_name.clone()),
@@ -246,6 +248,9 @@ fn struct_class(view: &View) -> Result<ClassDescriptor> {
         let access = member_access(view, member)?;
         let expr = access.getter(&ty);
         class.params.push(format!("{}: {ty}", member.name));
+        // A member is typed by the accessor class of its view, so that is the
+        // class this one names.
+        class.deps.push(ty.clone());
         class.getters.push(Getter {
             name: member.name.clone(),
             ty,
@@ -283,15 +288,70 @@ fn allocation(view: &View, members: &[Member], width: u32, total_bytes: u32) -> 
     Ok(format!("Math.max({elements}, {supplied})"))
 }
 
-fn emit_views(code: &mut CodeBuilder, registry: &Registry) -> Result<()> {
+/// The vectors and the matrices a schema needs, in that order.
+///
+/// Neither names a schema type, so one copy serves every shader in a batch.
+fn primitive_classes(registry: &Registry) -> Result<Vec<ClassDescriptor>> {
+    let mut classes = Vec::new();
     for (length, scalar) in registry.vectors() {
-        emit_class(code, &vector_class(length, scalar)?)?;
+        classes.push(vector_class(length, scalar)?);
     }
     for (columns, rows, scalar) in registry.matrices() {
-        emit_class(code, &matrix_class(columns, rows, scalar))?;
+        classes.push(matrix_class(columns, rows, scalar));
     }
+    Ok(classes)
+}
+
+/// Every accessor class a schema needs, in the order a self-contained file
+/// declares them: vectors, matrices, then arrays by name.
+pub fn accessor_classes(registry: &Registry) -> Result<Vec<ClassDescriptor>> {
+    let mut classes = primitive_classes(registry)?;
     for (name, base) in registry.arrays() {
-        emit_class(code, &array_class(name, base)?)?;
+        classes.push(array_class(name, base)?);
+    }
+    Ok(classes)
+}
+
+/// The accessor classes a batch writes once, for every shader in it.
+///
+/// These are the vectors, the matrices, and the arrays whose element is not a
+/// struct. Each is named after the element's own accessor type and depends on
+/// nothing but a stride, so two shaders that both use `vec3<f32>` want the same
+/// `Vector3f32` and it is written a single time.
+pub fn builtin_classes(registry: &Registry) -> Result<Vec<ClassDescriptor>> {
+    let mut classes = primitive_classes(registry)?;
+    for (name, base) in registry.builtin_arrays() {
+        classes.push(array_class(name, base)?);
+    }
+    Ok(classes)
+}
+
+/// The accessor classes that stay with this shader, because each one names a
+/// struct the same file declares.
+pub fn local_array_classes(registry: &Registry) -> Result<Vec<ClassDescriptor>> {
+    registry
+        .struct_arrays()
+        .map(|(name, base)| array_class(name, base))
+        .collect()
+}
+
+/// The classes that belong to one shader alone: the arrays over its own structs
+/// and the structs themselves.
+///
+/// The arrays come first, as they did when every class shared one file — the
+/// order within that set is the order the registry hands them out, so what is
+/// left of the old output keeps its relative order.
+pub fn shader_classes(registry: &Registry) -> Result<Vec<ClassDescriptor>> {
+    let mut classes = local_array_classes(registry)?;
+    for view in registry.structs() {
+        classes.push(struct_class(view)?);
+    }
+    Ok(classes)
+}
+
+pub(crate) fn emit_class_all(code: &mut CodeBuilder, classes: &[ClassDescriptor]) -> Result<()> {
+    for class in classes {
+        emit_class(code, class)?;
     }
     Ok(())
 }

@@ -95,6 +95,14 @@ pub struct ClassDescriptor {
     pub accessors: Vec<Accessor>,
     pub methods: Vec<Method>,
     pub getters: Vec<Getter>,
+    /// The other generated class names this one names.
+    ///
+    /// A vector or a matrix is self-contained: its accessors are `number`s. An
+    /// array names the accessor class for its element, and a struct names
+    /// whatever its members are typed as. Splitting the output into one file per
+    /// shared class turns this into the import list of whichever file the class
+    /// lands in.
+    pub deps: Vec<String>,
 }
 
 impl ClassDescriptor {

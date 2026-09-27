@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use color_eyre::{Result, eyre::WrapErr};
 
-use anygpu_gen_ts::codegen::generate_typescript;
+use anygpu_ts::codegen::generate_batch;
+use anygpu_ts::codegen::generate_typescript;
 
 const JSON: &str = "json";
-const TS: &str = "ts";
 
 /// The name a schema read from stdin is known by. A file always has a name of its
 /// own, so this is only reached when there is nothing to take one from.
@@ -47,23 +47,42 @@ fn main() -> Result<()> {
 ///
 /// Like `anygpu`, a folder is not searched recursively and the results go
 /// back into the input folder when no `-o` is given, each schema keeping its
-/// own name.
+/// own name. A folder is also a batch: the parts of the output that do not
+/// depend on any one schema — the support section, and the accessor classes
+/// several shaders share — are written once for the whole folder instead of
+/// once per shader, and each shader's file imports them.
 fn generate_dir(dir: &Path, output: Option<&Path>) -> Result<()> {
     let output_dir = output.unwrap_or(dir);
-    std::fs::create_dir_all(output_dir)
-        .wrap_err_with(|| format!("failed to create `{}`", output_dir.display()))?;
+    create_dir(output_dir)?;
 
-    for schema in schemas_in(dir)? {
-        let typescript = generate_file(&schema)?;
-        let name = schema
-            .file_name()
-            .expect("a directory entry should have a file name");
-        let destination = output_dir.join(name).with_extension(TS);
-        std::fs::write(&destination, typescript)
+    // Every schema is read before anything is generated, so the batch knows the
+    // full set of shared classes before it writes the first file.
+    let schemas = schemas_in(dir)?;
+    let shaders = schemas
+        .iter()
+        .map(|path| {
+            let schema: anygpu::ShaderBindings = read_input(Some(path))
+                .and_then(|source| Ok(anygpu::serde_json::from_str(&source)?))
+                .wrap_err_with(|| format!("failed to read `{}`", path.display()))?;
+            Ok((shader_name(Some(path)), schema))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let files = generate_batch(shaders.iter().map(|(name, schema)| (name.as_str(), schema)))?;
+    for file in files {
+        let destination = output_dir.join(&file.path);
+        if let Some(parent) = destination.parent() {
+            create_dir(parent)?;
+        }
+        std::fs::write(&destination, &file.contents)
             .wrap_err_with(|| format!("failed to write `{}`", destination.display()))?;
-        println!("{} -> {}", schema.display(), destination.display());
+        println!("{}", destination.display());
     }
     Ok(())
+}
+
+fn create_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).wrap_err_with(|| format!("failed to create `{}`", path.display()))
 }
 
 /// The name a schema is known by: the file it came from, without its extension.
@@ -106,13 +125,6 @@ fn read_input(path: Option<&Path>) -> Result<String> {
 fn generate(input: &str, name: &str) -> Result<String> {
     let schema: anygpu::ShaderBindings = anygpu::serde_json::from_str(input)?;
     generate_typescript(&schema, name)
-}
-
-/// Generates from a named file, so a failure in a batch says which one.
-fn generate_file(path: &Path) -> Result<String> {
-    let name = shader_name(Some(path));
-    generate(&read_input(Some(path))?, &name)
-        .wrap_err_with(|| format!("failed to generate from `{}`", path.display()))
 }
 
 fn write_output(path: Option<&Path>, typescript: &str) -> Result<()> {

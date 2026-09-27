@@ -4,12 +4,19 @@
 //! which entry point each stage runs, and which constants a stage can override.
 //! It says nothing about the half of a pipeline that only the host can decide —
 //! topology, vertex buffers, render target formats, the depth/stencil format,
-//! the sample count. A generated file therefore always emits the same support
-//! section (the native WebGPU types a descriptor is built from, plus one generic
-//! `PipelineHelper`) and, when the schema carries a pipeline, one concrete
-//! instance of it for that shader.
+//! the sample count.
+//!
+//! None of that depends on the shader, so the support section — the native
+//! WebGPU types a descriptor is built from, plus one generic `PipelineHelper` —
+//! is not written by the generator at all. It is a real TypeScript file,
+//! [`SUPPORT`], compiled into the binary and emitted verbatim. A batch writes it
+//! out once for the whole folder; a single schema carries it inline, so a
+//! one-file run is still self-contained.
+//!
+//! What is left for the generator is the part that does depend on the shader:
+//! when the schema carries a pipeline, one concrete instance of the helper.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use color_eyre::eyre::{Result, eyre};
 
@@ -47,278 +54,52 @@ pub fn helper_class(name: &str) -> String {
     format!("{}PipelineHelper", identifier(&pascal))
 }
 
-/// Writes the part of a file that does not depend on the shader: the WebGPU
-/// types the descriptor is assembled from, and the class that assembles it.
+/// The support section, verbatim: the WebGPU types the descriptor is assembled
+/// from, and the class that assembles it.
+///
+/// It is a real `.ts` file rather than something the generator assembles, since
+/// none of it depends on a schema. `include_str!` reads it at compile time, so a
+/// generated `support.ts` is a copy of the checked-in source, character for
+/// character, and the file is editable and type-checkable like any other.
+pub const SUPPORT: &str = include_str!("templates/support.ts");
+
+/// Writes the support section into a file that carries everything inline.
+///
+/// A batch has a `support.ts` of its own and imports from it instead; this is
+/// the single-file path, where the same text has to be in the one output.
 pub fn emit_support(code: &mut CodeBuilder) -> Result<()> {
     code.blank();
-    code.line("// The WebGPU half of a pipeline. The schema carries the bind groups, the");
-    code.line("// entry points and the overridable constants; everything a host decides is");
-    code.line("// handed to `generateDescriptor` instead.");
-    code.blank();
-
-    // The bind group types are aliases rather than interfaces of our own: a value
-    // passed to `createBindGroupLayout` is then checked against the real WebGPU
-    // shape, and a change to the API is a change in the type, not in this file.
-    // A `GPUBindGroupLayoutEntry` has no field for the WGSL name or for a binding
-    // array's length, so neither of those is part of an entry.
-    code.line("/** One entry of a bind group layout, as `createBindGroupLayout` takes it. */");
-    code.line("export type AnygpuBindGroupLayoutEntry = GPUBindGroupLayoutEntry;");
-    code.blank();
-    code.line("/** A bind group layout, as the device created it. */");
-    code.line("export type AnygpuBindGroupLayout = GPUBindGroupLayout;");
-    code.blank();
-    code.line("/** A pipeline layout, as the device created it. */");
-    code.line("export type AnygpuPipelineLayout = GPUPipelineLayout;");
-    code.blank();
-
-    code.line("/**");
-    code.line(" * The stages a pipeline is made of, as the flags `GPUShaderStage` gives them.");
-    code.line(" *");
-    code.line(" * They are spelled out instead of named through the global: TypeScript's own DOM");
-    code.line(
-        " * library has `GPUShaderStageFlags` but not the `GPUShaderStage` object, so a file that",
-    );
-    code.line(" * used the global would not compile without a hand-written declaration beside it.");
-    code.line(" * These are the values the specification gives that object, and a");
-    code.line(" * `GPUShaderStageFlags` is a number, so a `GPUBindGroupLayoutEntry` takes these.");
-    code.line(" */");
-    code.line("export const AnygpuShaderStage = {");
-    code.indented(|code| {
-        code.line("VERTEX: 1,");
-        code.line("FRAGMENT: 2,");
-        code.line("COMPUTE: 4,");
-        Ok(())
-    })?;
-    code.line("} as const;");
-    code.blank();
-
-    code.line("/**");
-    code.line(" * The half of a pipeline the schema does not carry: what a vertex stage");
-    code.line(" * reads, what it writes to, and how it is rasterised are host decisions.");
-    code.line(" */");
-    code.line("export interface AnygpuStageState {");
-    code.indented(|code| {
-        code.line("label?: string;");
-        code.line(
-            "vertex?: { buffers: GPUVertexBufferLayout[]; constants?: Record<string, number> };",
-        );
-        code.line(
-            "fragment?: { targets: GPUColorTargetState[]; constants?: Record<string, number> };",
-        );
-        code.line("compute?: { constants?: Record<string, number> };");
-        code.line("primitive?: GPUPrimitiveState;");
-        code.line("depthStencil?: GPUDepthStencilState;");
-        code.line("multisample?: GPUMultisampleState;");
-        Ok(())
-    })?;
-    code.line("}");
-    code.blank();
-
-    code.line(
-        "/** One stage as the schema describes it: where it starts, what it can override. */",
-    );
-    code.line("export interface AnygpuStage {");
-    code.indented(|code| {
-        code.line("entryPoint: string;");
-        code.line("constants: Record<string, number>;");
-        code.line("zeroInitializeWorkgroupMemory?: boolean;");
-        Ok(())
-    })?;
-    code.line("}");
-    code.blank();
-
-    code.line("/** Everything a shader's schema says about the pipeline it needs. */");
-    code.line("export interface AnygpuPipeline {");
-    code.indented(|code| {
-        code.line("/** One group per `@group`, each in ascending `binding` order. */");
-        code.line("bindGroupLayouts: AnygpuBindGroupLayoutEntry[][];");
-        // The shape of a `GPUPushConstantRange`, written out: `stages` is
-        // required, and a range is identified by the stages that may write it.
-        code.line(
-            "pushConstantRanges: { stages: GPUShaderStageFlags; start: number; end: number }[];",
-        );
-        code.line("vertex?: AnygpuStage;");
-        code.line("fragment?: AnygpuStage;");
-        code.line("compute?: AnygpuStage;");
-        Ok(())
-    })?;
-    code.line("}");
-    code.blank();
-
-    code.line("/**");
-    code.line(" * A pipeline the schema already described.");
-    code.line(" *");
-    code.line(" * `generateDescriptor` fills in everything the schema knows — the bind group");
-    code.line(" * layouts, the push constant ranges, the module, the entry points — so the");
-    code.line(" * caller only supplies the fixed-function state, and gets back a descriptor");
-    code.line(" * `createRenderPipeline` or `createComputePipeline` accepts as it is.");
-    code.line(" */");
-    code.line("export class PipelineHelper {");
-    code.indented(|code| {
-        code.line("public constructor(private readonly pipeline: AnygpuPipeline) {}");
-        code.blank();
-        code.line("/** One bind group layout per group, in group order. */");
-        code.line("public bindGroupLayouts(device: GPUDevice): AnygpuBindGroupLayout[] {");
-        code.indented(|code| {
-            code.line("return this.pipeline.bindGroupLayouts.map((entries, group) =>");
-            code.indented(|code| {
-                code.line(
-                    "device.createBindGroupLayout({ label: `anygpu group ${group}`, entries }),",
-                );
-                Ok(())
-            })?;
-            code.line(");");
-            Ok(())
-        })?;
-        code.line("}");
-        code.blank();
-        code.line("/** The layout every stage of this pipeline binds against. */");
-        code.line("public pipelineLayout(device: GPUDevice): AnygpuPipelineLayout {");
-        code.indented(|code| {
-            code.line("return device.createPipelineLayout({");
-            code.indented(|code| {
-                code.line("bindGroupLayouts: this.bindGroupLayouts(device),");
-                code.line("pushConstantRanges: this.pipeline.pushConstantRanges,");
-                Ok(())
-            })?;
-            code.line("});");
-            Ok(())
-        })?;
-        code.line("}");
-        code.blank();
-        code.line("/** A stage's overridable constants, with the host's overrides on top. */");
-        code.line("private static constants(");
-        code.indented(|code| {
-            code.line("stage: AnygpuStage,");
-            code.line("overrides: Record<string, number> | undefined,");
-            Ok(())
-        })?;
-        code.line("): Record<string, number> {");
-        code.indented(|code| {
-            code.line("return { ...stage.constants, ...overrides };");
-            Ok(())
-        })?;
-        code.line("}");
-        code.blank();
-        code.line("/**");
-        code.line(" * A compute pipeline when the shader has a compute stage, a render pipeline");
-        code.line(" * otherwise, both bound to the layout above.");
-        code.line(" */");
-        code.line("public generateDescriptor(");
-        code.indented(|code| {
-            code.line("device: GPUDevice,");
-            code.line("shaderModule: GPUShaderModule,");
-            code.line("host: AnygpuStageState = {},");
-            Ok(())
-        })?;
-        code.line("): GPURenderPipelineDescriptor | GPUComputePipelineDescriptor {");
-        code.indented(|code| {
-            code.line("const layout = this.pipelineLayout(device);");
-            code.line("const compute = this.pipeline.compute;");
-            code.line("if (compute !== undefined) {");
-            code.indented(|code| {
-                code.line("// The intersection keeps the flag assignable whether or not the");
-                code.line("// installed WebGPU types know about it yet.");
-                code.line(
-                    "const state: GPUComputeState & { zeroInitializeWorkgroupMemory?: boolean } = {",
-                );
-                code.indented(|code| {
-                    code.line("module: shaderModule,");
-                    code.line("entryPoint: compute.entryPoint,");
-                    code.line("constants: PipelineHelper.constants(compute, host.compute?.constants),");
-                    Ok(())
-                })?;
-                code.line("};");
-                code.line("if (compute.zeroInitializeWorkgroupMemory === true) {");
-                code.indented(|code| {
-                    code.line("state.zeroInitializeWorkgroupMemory = true;");
-                    Ok(())
-                })?;
-                code.line("}");
-                code.line("const descriptor: GPUComputePipelineDescriptor = { layout, compute: state };");
-                code.line("if (host.label !== undefined) { descriptor.label = host.label; }");
-                code.line("return descriptor;");
-                Ok(())
-            })?;
-            code.line("}");
-            code.blank();
-            code.line("const vertex = this.pipeline.vertex;");
-            code.line("if (vertex === undefined) {");
-            code.indented(|code| {
-                code.line("throw new Error(");
-                code.indented(|code| {
-                    code.line(concat!(
-                        "`${this.constructor.name} has no vertex stage, ",
-                        "so no render pipeline can be made from it`,"
-                    ));
-                    Ok(())
-                })?;
-                code.line(");");
-                Ok(())
-            })?;
-            code.line("}");
-            code.blank();
-            code.line("const descriptor: GPURenderPipelineDescriptor = {");
-            code.indented(|code| {
-                code.line("layout,");
-                code.line("vertex: {");
-                code.indented(|code| {
-                    code.line("module: shaderModule,");
-                    code.line("entryPoint: vertex.entryPoint,");
-                    code.line("buffers: host.vertex?.buffers ?? [],");
-                    code.line("constants: PipelineHelper.constants(vertex, host.vertex?.constants),");
-                    Ok(())
-                })?;
-                code.line("},");
-                Ok(())
-            })?;
-            code.line("};");
-            code.blank();
-            code.line("const fragment = this.pipeline.fragment;");
-            code.line("if (fragment !== undefined) {");
-            code.indented(|code| {
-                code.line("const targets = host.fragment?.targets;");
-                code.line("if (targets === undefined) {");
-                code.indented(|code| {
-                    code.line("throw new Error(");
-                    code.indented(|code| {
-                        code.line(concat!(
-                            "`${this.constructor.name} has a fragment stage, so ",
-                            "fragment.targets has to come from the host`,",
-                        ));
-                        Ok(())
-                    })?;
-                    code.line(");");
-                    Ok(())
-                })?;
-                code.line("}");
-                code.line("descriptor.fragment = {");
-                code.indented(|code| {
-                    code.line("module: shaderModule,");
-                    code.line("entryPoint: fragment.entryPoint,");
-                    code.line("targets,");
-                    code.line(
-                        "constants: PipelineHelper.constants(fragment, host.fragment?.constants),",
-                    );
-                    Ok(())
-                })?;
-                code.line("};");
-                Ok(())
-            })?;
-            code.line("}");
-            code.blank();
-            code.line("if (host.label !== undefined) { descriptor.label = host.label; }");
-            code.line("if (host.primitive !== undefined) { descriptor.primitive = host.primitive; }");
-            code.line("if (host.depthStencil !== undefined) { descriptor.depthStencil = host.depthStencil; }");
-            code.line("if (host.multisample !== undefined) { descriptor.multisample = host.multisample; }");
-            code.line("return descriptor;");
-            Ok(())
-        })?;
-        code.line("}");
-        Ok(())
-    })?;
-    code.line("}");
+    for line in SUPPORT.lines() {
+        code.line(line);
+    }
     Ok(())
+}
+
+/// The names from the support section that this pipeline's instance refers to.
+///
+/// A batch's per-shader file gets the support section from `support.ts`, so it
+/// has to say which pieces of it it uses. `PipelineHelper` is named by the
+/// instance itself, always. `AnygpuShaderStage` is named wherever a stage mask
+/// is written, which is wherever a binding or a push constant range resolved at
+/// least one stage — the same rule [`stages`] applies, minus the case where it
+/// writes a bare `0`.
+pub fn support_symbols(pipeline: &PipelineDescriptor) -> BTreeSet<&'static str> {
+    let mut symbols = BTreeSet::from(["PipelineHelper"]);
+    let mask = pipeline
+        .layout
+        .bind_group_layouts
+        .iter()
+        .flat_map(|group| &group.entries)
+        .any(|entry| !entry.visibility.is_empty())
+        || pipeline
+            .layout
+            .push_constant_ranges
+            .iter()
+            .any(|range| !range.stages.is_empty());
+    if mask {
+        symbols.insert("AnygpuShaderStage");
+    }
+    symbols
 }
 
 /// Writes the one export that belongs to a single shader: the pipeline its
