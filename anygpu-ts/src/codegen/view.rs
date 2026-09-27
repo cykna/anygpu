@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use anygpu::{MemberDescriptor, TypeDescriptor, TypeInfo};
 use color_eyre::eyre::{Result, eyre};
@@ -75,8 +75,45 @@ pub struct Member {
     pub view: View,
 }
 
-impl View {
-    pub fn build(ty: &TypeInfo) -> Result<Self> {
+/// Every view a schema needs, built at most once each.
+///
+/// The schema lists each type once and names the types it is built from by id, so
+/// a view is looked up by the id that refers to it and cached under that same id.
+/// `vec3<f32>` used by ten structs is therefore resolved — and validated — once,
+/// and every one of those members shares the one view.
+#[derive(Debug)]
+pub struct Views<'a> {
+    types: HashMap<&'a str, &'a TypeInfo>,
+    built: HashMap<&'a str, View>,
+}
+
+impl<'a> Views<'a> {
+    pub fn new(types: &'a [TypeInfo]) -> Self {
+        let types = types
+            .iter()
+            .map(|ty| (ty.id.as_str(), ty))
+            .collect::<HashMap<_, _>>();
+        Self {
+            types,
+            built: HashMap::new(),
+        }
+    }
+
+    /// The view of the type `id` names, built on first use and cached after.
+    pub fn get(&mut self, id: &'a str) -> Result<View> {
+        if let Some(view) = self.built.get(id) {
+            return Ok(view.clone());
+        }
+        let ty = *self
+            .types
+            .get(id)
+            .ok_or_else(|| eyre!("the schema has no type `{id}`"))?;
+        let view = self.build(ty)?;
+        self.built.insert(id, view.clone());
+        Ok(view)
+    }
+
+    fn build(&mut self, ty: &'a TypeInfo) -> Result<View> {
         let kind = match &ty.descriptor {
             TypeDescriptor::Scalar { scalar } => ViewKind::Scalar(scalar::layout(scalar)?),
             TypeDescriptor::Vector { length, scalar } => {
@@ -105,7 +142,7 @@ impl View {
             TypeDescriptor::Array { base, size, stride } => ViewKind::Array {
                 size: *size,
                 stride: *stride,
-                element: Box::new(View::build(base)?),
+                element: Box::new(self.get(base.as_str())?),
             },
             TypeDescriptor::Atomic { scalar } => ViewKind::Atomic(scalar::layout(scalar)?),
             TypeDescriptor::Struct {
@@ -122,7 +159,7 @@ impl View {
                         Ok(Member {
                             name: member_name(member, index),
                             offset: member.offset,
-                            view: View::build(&member.ty)?,
+                            view: self.get(member.ty.as_str())?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -138,12 +175,14 @@ impl View {
                 ));
             }
         };
-        Ok(Self {
+        Ok(View {
             name: ty.name.clone(),
             kind,
         })
     }
+}
 
+impl View {
     pub fn as_struct(&self) -> Option<&StructView> {
         match &self.kind {
             ViewKind::Struct(view) => Some(view),

@@ -5,4 +5,6 @@ pub use serde_json;
 pub use shaders::ShaderBindings;
 pub use shaders::ShaderMetadata;
 pub use shaders::image::*;
+pub use shaders::pipeline::types::*;
+pub use shaders::pipeline::*;
 pub use shaders::types::*;

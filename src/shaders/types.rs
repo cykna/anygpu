@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::fmt::{self, Display};
+
 use naga::{ArraySize, Handle, ScalarKind, Type, TypeInner, VectorSize, proc::Alignment};
 use serde::{Deserialize, Serialize};
 
@@ -28,14 +31,14 @@ impl ScalarInfo {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberDescriptor {
     pub name: String,
     pub offset: u32,
-    pub ty: Box<TypeInfo>,
+    pub ty: TypeId,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeDescriptor {
     Scalar {
         scalar: ScalarInfo,
@@ -53,12 +56,12 @@ pub enum TypeDescriptor {
         scalar: ScalarInfo,
     },
     Array {
-        base: Box<TypeInfo>,
+        base: TypeId,
         size: Option<u32>,
         stride: u32,
     },
     BindingArray {
-        base: Box<TypeInfo>,
+        base: TypeId,
         size: Option<u32>,
     },
     Struct {
@@ -67,7 +70,7 @@ pub enum TypeDescriptor {
         members: Vec<MemberDescriptor>,
     },
     Pointer {
-        base: Box<TypeInfo>,
+        base: TypeId,
     },
     Sampler {
         comparison: bool,
@@ -79,10 +82,69 @@ pub enum TypeDescriptor {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TypeId(pub String);
+
+impl TypeId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TypeInfo {
+    pub id: TypeId,
     pub name: String,
     pub descriptor: TypeDescriptor,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TypeInterner {
+    types: Vec<TypeInfo>,
+    by_key: HashMap<(String, TypeDescriptor), TypeId>,
+}
+
+impl TypeInterner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Interns one type, returning the id it is known by.
+    ///
+    /// `build` describes the type and is handed the interner so that whatever it
+    /// is built from is interned first. Children are therefore always defined
+    /// before the types that name them, which is the order [`Self::finish`] lists
+    /// them in.
+    pub fn intern(
+        &mut self,
+        name: String,
+        build: impl FnOnce(&mut Self) -> TypeDescriptor,
+    ) -> TypeId {
+        let descriptor = build(self);
+        if let Some(id) = self.by_key.get(&(name.clone(), descriptor.clone())) {
+            return id.clone();
+        }
+        let id = TypeId(format!("t{}", self.types.len()));
+        self.by_key
+            .insert((name.clone(), descriptor.clone()), id.clone());
+        self.types.push(TypeInfo {
+            id: id.clone(),
+            name,
+            descriptor,
+        });
+        id
+    }
+
+    /// The interned types, each defined once, in the order they were reached.
+    pub fn finish(self) -> Vec<TypeInfo> {
+        self.types
+    }
 }
 
 impl<'a> ShaderMetadata<'a> {
@@ -105,10 +167,27 @@ impl<'a> ShaderMetadata<'a> {
         }
     }
 
-    pub fn get_type_info(&self, handle: Handle<Type>) -> TypeInfo {
-        let name = self.get_type_name(handle);
+    /// Interns the type at `handle`, together with everything it is built from.
+    ///
+    /// `memo` keeps one handle from being walked twice. WGSL has no recursive
+    /// types, so interning the children before the parent cannot cycle.
+    pub fn type_id(
+        &self,
+        interner: &mut TypeInterner,
+        memo: &mut HashMap<Handle<Type>, TypeId>,
+        handle: Handle<Type>,
+    ) -> TypeId {
+        if let Some(id) = memo.get(&handle) {
+            return id.clone();
+        }
         let ty = self.module.types.get_handle(handle).unwrap();
-        let descriptor = match &ty.inner {
+        let name = self.get_type_name(handle);
+        let layout = match &ty.inner {
+            TypeInner::Struct { .. } => Some(self.layouter[handle]),
+            _ => None,
+        };
+        let inner = &ty.inner;
+        let id = interner.intern(name, |interner| match inner {
             TypeInner::Scalar(s) => TypeDescriptor::Scalar {
                 scalar: ScalarInfo::from_kind(s.kind, s.width),
             },
@@ -133,7 +212,7 @@ impl<'a> ShaderMetadata<'a> {
             },
 
             TypeInner::Array { base, size, stride } => TypeDescriptor::Array {
-                base: Box::new(self.get_type_info(*base)),
+                base: self.type_id(interner, memo, *base),
                 size: match size {
                     naga::ArraySize::Constant(n) => Some(n.get()),
                     _ => None,
@@ -142,13 +221,13 @@ impl<'a> ShaderMetadata<'a> {
             },
 
             TypeInner::Struct { members, span } => {
-                let layout = self.layouter[handle]; // TypeLayout já calculado
+                let layout = layout.expect("a struct is laid out when it is reached");
                 let members = members
                     .iter()
                     .map(|m| MemberDescriptor {
                         name: m.name.clone().unwrap_or_default(),
                         offset: m.offset,
-                        ty: Box::new(self.get_type_info(m.ty)),
+                        ty: self.type_id(interner, memo, m.ty),
                     })
                     .collect();
                 let len: u32 = match layout.alignment {
@@ -169,7 +248,7 @@ impl<'a> ShaderMetadata<'a> {
             }
 
             TypeInner::Pointer { base, .. } => TypeDescriptor::Pointer {
-                base: Box::new(self.get_type_info(*base)),
+                base: self.type_id(interner, memo, *base),
             },
 
             TypeInner::Image {
@@ -203,7 +282,7 @@ impl<'a> ShaderMetadata<'a> {
             },
 
             TypeInner::BindingArray { base, size } => TypeDescriptor::BindingArray {
-                base: Box::new(self.get_type_info(*base)),
+                base: self.type_id(interner, memo, *base),
                 size: match size {
                     naga::ArraySize::Constant(n) => Some(n.get()),
                     naga::ArraySize::Dynamic => None,
@@ -213,8 +292,9 @@ impl<'a> ShaderMetadata<'a> {
 
             #[allow(unreachable_patterns)]
             _ => unreachable!("tipo não coberto"),
-        };
-        TypeInfo { name, descriptor }
+        });
+        memo.insert(handle, id.clone());
+        id
     }
 
     pub fn get_type_name(&self, ty: Handle<Type>) -> String {
@@ -267,11 +347,12 @@ impl<'a> ShaderMetadata<'a> {
                     }
                 }
 
-                TypeInner::Struct { members, .. } => {
-                    // sem nome próprio: gera algo derivado dos membros
+                TypeInner::Struct { members, span } => {
+                    // sem nome próprio: deriva dos membros e do tamanho, para que
+                    // duas structs anônimas diferentes nunca compartilhem nome
                     let members: Vec<String> =
                         members.iter().map(|m| self.get_type_name(m.ty)).collect();
-                    format!("anon_struct<{}>", members.join(", "))
+                    format!("anon_struct<{} /* {} bytes */>", members.join(", "), span)
                 }
 
                 TypeInner::Image { .. } => "texture".to_string(),

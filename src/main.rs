@@ -6,9 +6,7 @@ use std::{
 
 use clap::Parser;
 
-use crate::shaders::ShaderMetadata;
-
-mod shaders;
+use anygpu::ShaderMetadata;
 
 pub fn compile_wgsl(
     wgsl_source: &str,

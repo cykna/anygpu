@@ -1,9 +1,11 @@
 use color_eyre::eyre::{Result, eyre};
 
 use crate::codegen::descriptors::{Access, Accessor, ClassDescriptor, Getter, Method};
+use crate::codegen::pipeline;
 use crate::codegen::registry::Registry;
 use crate::codegen::scalar::ScalarLayout;
 use crate::codegen::view::{Member, View, ViewKind, component};
+use anygpu::PipelineDescriptor;
 
 const INDENT: &str = "  ";
 
@@ -55,6 +57,21 @@ impl CodeBuilder {
 
     pub fn emit_struct(&mut self, view: &View) -> Result<()> {
         emit_struct(self, view)
+    }
+
+    /// The part of a file that does not depend on the shader: the WebGPU types a
+    /// pipeline descriptor is built from and the class that builds it.
+    pub fn emit_pipeline_support(&mut self) -> Result<()> {
+        pipeline::emit_support(self)
+    }
+
+    /// The one export that belongs to a single shader.
+    pub fn emit_shader_pipeline(
+        &mut self,
+        name: &str,
+        pipeline: &PipelineDescriptor,
+    ) -> Result<()> {
+        pipeline::emit_shader(self, name, pipeline)
     }
 }
 

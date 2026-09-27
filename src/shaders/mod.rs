@@ -1,13 +1,26 @@
 pub mod image;
+pub mod pipeline;
 pub mod types;
 use naga::{Handle, Module, Type, TypeInner, proc::Layouter};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::shaders::types::TypeInfo;
+use crate::shaders::{
+    pipeline::types::{BindGroupLayoutEntry, PipelineDescriptor},
+    types::{TypeInfo, TypeInterner},
+};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ShaderBindings {
+    #[serde(default)]
     pub types: Vec<TypeInfo>,
+    /// The pipeline this shader needs, or `None` when the schema carries types
+    /// only. A generator emits whatever a shader's consumers need, so a missing
+    /// pipeline is not an error: it only means there is nothing to describe one
+    /// with.
+    #[serde(default, alias = "pipeline_descriptor")]
+    pub pipelines: Option<PipelineDescriptor>,
+    #[serde(default)]
+    pub bindgroups: Vec<BindGroupLayoutEntry>,
 }
 #[derive(Debug)]
 pub struct ShaderMetadata<'a> {
@@ -61,13 +74,29 @@ impl<'a> ShaderMetadata<'a> {
         })
     }
 
-    pub fn get_types(&self) -> impl Iterator<Item = TypeInfo> {
-        self.external_types.iter().map(|ty| self.get_type_info(*ty))
+    /// Every type reachable from a binding or an entry point argument, defined
+    /// once each and in dependency order: a type is always listed after
+    /// everything it is built from.
+    pub fn get_types(&self) -> Vec<TypeInfo> {
+        let mut interner = TypeInterner::new();
+        let mut memo = HashMap::new();
+        // `external_types` is a set, so it is walked in handle order to keep the
+        // ids — and therefore the schema — identical from one run to the next.
+        let mut roots: Vec<Handle<Type>> = self.external_types.iter().copied().collect();
+        roots.sort_by_key(|handle| handle.index());
+        for handle in roots {
+            self.type_id(&mut interner, &mut memo, handle);
+        }
+        interner.finish()
     }
 
     pub fn generate_bindings(self) -> ShaderBindings {
+        let types = self.get_types();
+        let pipelines = self.get_pipeline();
         ShaderBindings {
-            types: self.get_types().collect(),
+            types,
+            pipelines: Some(pipelines),
+            bindgroups: Vec::new(),
         }
     }
 }

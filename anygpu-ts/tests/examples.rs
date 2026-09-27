@@ -16,7 +16,7 @@ use anygpu_gen_ts::codegen::generate_typescript;
 use color_eyre::eyre::{Result, eyre};
 
 /// Folders, relative to the workspace root, holding generator inputs.
-const INPUT_DIRS: &[&str] = &["examples", "fixtures"];
+const INPUT_DIRS: &[&str] = &["examples"];
 
 const WGSL: &str = "wgsl";
 const JSON: &str = "json";
@@ -47,7 +47,13 @@ fn generate(path: &Path) -> Result<String> {
         other => return Err(eyre!("`{other:?}` is not a generator input")),
     };
 
-    let typescript = generate_typescript(&schema)?;
+    // A generated pipeline helper is named after the file it was generated from,
+    // so the name has to travel with the input rather than with the schema.
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .expect("an input file should have a name");
+    let typescript = generate_typescript(&schema, name)?;
     if typescript.trim().is_empty() {
         return Err(eyre!("generated no TypeScript"));
     }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::shaders::types::ScalarInfo;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageFormat {
     R8Unorm,
     R8Snorm,
@@ -95,25 +95,33 @@ impl From<naga::StorageFormat> for StorageFormat {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageAccess {
     Load,
     Store,
+    /// A `read_write` storage buffer, which naga reports as `LOAD | STORE`.
+    LoadStore,
     Atomic,
 }
 
 impl From<naga::StorageAccess> for StorageAccess {
     fn from(value: naga::StorageAccess) -> Self {
+        // `naga::StorageAccess` is a set of flags, and the flags combine, so the
+        // pair is matched through a guard: `LOAD | STORE` written in a pattern
+        // would mean "LOAD or STORE" rather than "both".
         match value {
             naga::StorageAccess::LOAD => Self::Load,
             naga::StorageAccess::STORE => Self::Store,
             naga::StorageAccess::ATOMIC => Self::Atomic,
+            other if other == naga::StorageAccess::LOAD | naga::StorageAccess::STORE => {
+                Self::LoadStore
+            }
             other => unreachable!("{other:?}"),
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImageDimension {
     D1,
     D2,
@@ -121,7 +129,7 @@ pub enum ImageDimension {
     Cube,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImageClass {
     Sampled {
         kind: ScalarInfo,
