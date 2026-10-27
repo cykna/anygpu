@@ -82,7 +82,22 @@ pub enum TypeDescriptor {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+impl TypeDescriptor {
+    /// Whether the type is intrinsic to WGSL itself - a scalar, vector, matrix or
+    /// atomic - and therefore shared by every shader that names it, rather than
+    /// being declared by one shader's source.
+    pub fn is_shared(&self) -> bool {
+        matches!(
+            self,
+            TypeDescriptor::Scalar { .. }
+                | TypeDescriptor::Vector { .. }
+                | TypeDescriptor::Matrix { .. }
+                | TypeDescriptor::Atomic { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TypeId(pub String);
 
 impl TypeId {
@@ -99,6 +114,7 @@ impl Display for TypeId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TypeInfo {
+    #[serde(default)]
     pub id: TypeId,
     pub name: String,
     pub descriptor: TypeDescriptor,
@@ -115,22 +131,43 @@ impl TypeInterner {
         Self::default()
     }
 
-    /// Interns one type, returning the id it is known by.
-    ///
-    /// `build` describes the type and is handed the interner so that whatever it
-    /// is built from is interned first. Children are therefore always defined
-    /// before the types that name them, which is the order [`Self::finish`] lists
-    /// them in.
+    /// Interns one shader-specific type, giving it an id of its own: `t0`, `t1`,
+    /// and so on.
     pub fn intern(
         &mut self,
         name: String,
         build: impl FnOnce(&mut Self) -> TypeDescriptor,
     ) -> TypeId {
+        self.intern_prefixed(name, build, "t")
+    }
+
+    /// Interns one type that is intrinsic to WGSL itself - a scalar, a vector or
+    /// a matrix - which every shader shares, giving it an id of its own that says
+    /// so: `st0`, `st1`, and so on.
+    pub fn intern_shared(
+        &mut self,
+        name: String,
+        build: impl FnOnce(&mut Self) -> TypeDescriptor,
+    ) -> TypeId {
+        self.intern_prefixed(name, build, "st")
+    }
+
+    fn intern_prefixed(
+        &mut self,
+        name: String,
+        build: impl FnOnce(&mut Self) -> TypeDescriptor,
+        prefix: &str,
+    ) -> TypeId {
         let descriptor = build(self);
         if let Some(id) = self.by_key.get(&(name.clone(), descriptor.clone())) {
             return id.clone();
         }
-        let id = TypeId(format!("t{}", self.types.len()));
+        let index = self
+            .types
+            .iter()
+            .filter(|ty| ty.id.as_str().starts_with(prefix))
+            .count();
+        let id = TypeId(format!("{prefix}{index}"));
         self.by_key
             .insert((name.clone(), descriptor.clone()), id.clone());
         self.types.push(TypeInfo {
@@ -180,14 +217,36 @@ impl<'a> ShaderMetadata<'a> {
         if let Some(id) = memo.get(&handle) {
             return id.clone();
         }
-        let ty = self.module.types.get_handle(handle).unwrap();
         let name = self.get_type_name(handle);
+        let descriptor = self.type_descriptor(interner, memo, handle);
+        // Types intrinsic to WGSL itself - scalars, vectors, matrices - are
+        // shared by every shader, so they are interned under their own prefix.
+        let id = if descriptor.is_shared() {
+            interner.intern_shared(name, |_| descriptor)
+        } else {
+            interner.intern(name, |_| descriptor)
+        };
+        memo.insert(handle, id.clone());
+        id
+    }
+
+    /// Describes the type at `handle`, together with everything it is built from.
+    ///
+    /// The interner is handed to the built type so that whatever it names is
+    /// interned first, which keeps children ahead of the types that name them.
+    fn type_descriptor(
+        &self,
+        interner: &mut TypeInterner,
+        memo: &mut HashMap<Handle<Type>, TypeId>,
+        handle: Handle<Type>,
+    ) -> TypeDescriptor {
+        let ty = self.module.types.get_handle(handle).unwrap();
         let layout = match &ty.inner {
             TypeInner::Struct { .. } => Some(self.layouter[handle]),
             _ => None,
         };
         let inner = &ty.inner;
-        let id = interner.intern(name, |interner| match inner {
+        match inner {
             TypeInner::Scalar(s) => TypeDescriptor::Scalar {
                 scalar: ScalarInfo::from_kind(s.kind, s.width),
             },
@@ -292,9 +351,7 @@ impl<'a> ShaderMetadata<'a> {
 
             #[allow(unreachable_patterns)]
             _ => unreachable!("tipo não coberto"),
-        });
-        memo.insert(handle, id.clone());
-        id
+        }
     }
 
     pub fn get_type_name(&self, ty: Handle<Type>) -> String {

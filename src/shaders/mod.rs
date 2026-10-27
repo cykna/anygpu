@@ -10,9 +10,17 @@ use crate::shaders::{
     types::{TypeInfo, TypeInterner},
 };
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SharedTypes {
+    #[serde(default)]
+    pub types: Vec<TypeInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ShaderBindings {
     #[serde(default)]
     pub types: Vec<TypeInfo>,
+    #[serde(default)]
+    pub shared: Option<SharedTypes>,
     /// The pipeline this shader needs, or `None` when the schema carries types
     /// only. A generator emits whatever a shader's consumers need, so a missing
     /// pipeline is not an error: it only means there is nothing to describe one
@@ -92,11 +100,70 @@ impl<'a> ShaderMetadata<'a> {
 
     pub fn generate_bindings(self) -> ShaderBindings {
         let types = self.get_types();
+        // The types intrinsic to WGSL itself - vectors, scalars, matrices - are
+        // shared by every shader, so they are described once, under the shared
+        // section, while the rest are the types this shader declares for itself.
+        let mut shared_types = Vec::new();
+        let mut shader_types = Vec::new();
+        for ty in types {
+            if ty.descriptor.is_shared() {
+                shared_types.push(ty);
+            } else {
+                shader_types.push(ty);
+            }
+        }
         let pipelines = self.get_pipeline();
         ShaderBindings {
-            types,
+            types: shader_types,
+            shared: Some(SharedTypes {
+                types: shared_types,
+            }),
             pipelines: Some(pipelines),
             bindgroups: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shaders::types::TypeDescriptor;
+
+    const CAMERA_WGSL: &str = r"
+struct Camera {
+    position: vec4<f32>,
+    rot: mat4x4<f32>,
+}
+
+@group(0) @binding(0) var<uniform> camera: Camera;
+";
+
+    #[test]
+    fn wgsl_intrinsics_go_to_the_shared_section() {
+        let module = naga::front::wgsl::parse_str(CAMERA_WGSL).expect("the shader should parse");
+        let bindings = ShaderMetadata::new(&module)
+            .expect("the shader should expose bindings")
+            .generate_bindings();
+
+        // The vectors and matrices WGSL itself defines are shared by every shader,
+        // so they are described once, under the shared section, as `st0`, `st1`, and
+        // so on.
+        let shared = bindings.shared.expect("the intrinsics should be shared");
+        let shared_types: Vec<&TypeInfo> = shared.types.iter().collect();
+        assert_eq!(shared_types.len(), 2, "{shared_types:?}");
+        assert_eq!(shared_types[0].id.as_str(), "st0");
+        assert_eq!(shared_types[0].name, "vec4<f32>");
+        assert_eq!(shared_types[1].id.as_str(), "st1");
+        assert_eq!(shared_types[1].name, "mat4x4<f32>");
+
+        // The struct the shader declares is its own, and its members point at the
+        // shared types they are built from.
+        let types = &bindings.types;
+        assert_eq!(types.len(), 1, "{types:?}");
+        let TypeDescriptor::Struct { members, .. } = &types[0].descriptor else {
+            panic!("the type should be a struct: {types:?}");
+        };
+        assert_eq!(members[0].ty.as_str(), "st0");
+        assert_eq!(members[1].ty.as_str(), "st1");
     }
 }
