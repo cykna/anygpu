@@ -49,7 +49,7 @@ fn compile_entry(args: &Args, entry: &Path) -> color_eyre::Result<String> {
         .validate(&module)?;
     }
     let shader = ShaderMetadata::new(&module)?;
-    let output_content = serde_json::to_string_pretty(&shader.generate_bindings())?;
+    let output_content = serde_json::to_string_pretty(&shader.generate_bindings()?)?;
     Ok(output_content)
 }
 

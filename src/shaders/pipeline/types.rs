@@ -6,11 +6,10 @@
 //! — which is a separate task, so everything below is a definition with no
 //! behaviour behind it.
 //!
-//! Names and shapes follow the equivalent `wgpu` descriptors, minus everything
-//! only the consuming host can decide when it builds the real pipeline: vertex
-//! buffer layouts, render target formats and blend states, primitive topology,
-//! and the depth/stencil format. What is left is what can be read back out of the
-//! WGSL itself.
+//! Names and shapes follow the equivalent `wgpu` descriptors, plus a default
+//! vertex-buffer layout derived from the vertex entry point's reflected input
+//! types. Render-target formats, blend states, primitive topology, and the
+//! depth/stencil format remain host decisions.
 
 use std::collections::HashMap;
 
@@ -153,13 +152,70 @@ pub struct PipelineCompilationOptions {
     pub zero_initialize_workgroup_memory: bool,
 }
 
+/// A vertex attribute exposed by an entry point and its default buffer layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexAttribute {
+    pub name: String,
+    pub shader_location: u32,
+    pub ty: crate::TypeId,
+    pub format: VertexFormat,
+    pub offset: u64,
+}
+
+/// One logical vertex-stage input. `format` is `None` when the WGSL input
+/// cannot be represented by one WebGPU vertex attribute.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexInput {
+    pub name: String,
+    pub shader_location: u32,
+    pub ty: crate::TypeId,
+    pub format: Option<VertexFormat>,
+    pub offset: u64,
+}
+
+/// Vertex formats representable by WebGPU's fixed-function vertex fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VertexFormat {
+    Float16x2,
+    Float16x4,
+    Float32,
+    Float32x2,
+    Float32x3,
+    Float32x4,
+    Sint32,
+    Sint32x2,
+    Sint32x3,
+    Sint32x4,
+    Uint32,
+    Uint32x2,
+    Uint32x3,
+    Uint32x4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VertexStepMode {
+    Vertex,
+}
+
+/// A default interleaved buffer layout using the reflected input struct's
+/// member offsets and size. This is a usable convention, not a WGSL requirement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VertexBufferLayout {
+    pub array_stride: u64,
+    pub step_mode: VertexStepMode,
+    pub attributes: Vec<VertexAttribute>,
+}
+
 /// Mirrors `wgpu::VertexState`, minus `module` (the shader itself, which the
-/// generator already has) and minus `buffers`: how vertex data is laid out is
-/// the host's decision, and none of it is visible in the WGSL.
+/// generator already has).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexState {
     pub entry_point: String,
     pub compilation_options: PipelineCompilationOptions,
+    #[serde(default)]
+    pub inputs: Vec<VertexInput>,
+    #[serde(default)]
+    pub buffers: Option<Vec<VertexBufferLayout>>,
 }
 
 /// Mirrors `wgpu::FragmentState`, minus `module` and minus `targets`: the render

@@ -85,7 +85,7 @@ impl<'a> ShaderMetadata<'a> {
     /// Every type reachable from a binding or an entry point argument, defined
     /// once each and in dependency order: a type is always listed after
     /// everything it is built from.
-    pub fn get_types(&self) -> Vec<TypeInfo> {
+    fn get_types_with_ids(&self) -> (Vec<TypeInfo>, HashMap<Handle<Type>, crate::TypeId>) {
         let mut interner = TypeInterner::new();
         let mut memo = HashMap::new();
         // `external_types` is a set, so it is walked in handle order to keep the
@@ -95,11 +95,15 @@ impl<'a> ShaderMetadata<'a> {
         for handle in roots {
             self.type_id(&mut interner, &mut memo, handle);
         }
-        interner.finish()
+        (interner.finish(), memo)
     }
 
-    pub fn generate_bindings(self) -> ShaderBindings {
-        let types = self.get_types();
+    pub fn get_types(&self) -> Vec<TypeInfo> {
+        self.get_types_with_ids().0
+    }
+
+    pub fn generate_bindings(self) -> color_eyre::Result<ShaderBindings> {
+        let (types, type_ids) = self.get_types_with_ids();
         // The types intrinsic to WGSL itself - vectors, scalars, matrices - are
         // shared by every shader, so they are described once, under the shared
         // section, while the rest are the types this shader declares for itself.
@@ -112,15 +116,15 @@ impl<'a> ShaderMetadata<'a> {
                 shader_types.push(ty);
             }
         }
-        let pipelines = self.get_pipeline();
-        ShaderBindings {
+        let pipelines = self.get_pipeline_with_ids(&type_ids)?;
+        Ok(ShaderBindings {
             types: shader_types,
             shared: Some(SharedTypes {
                 types: shared_types,
             }),
             pipelines: Some(pipelines),
             bindgroups: Vec::new(),
-        }
+        })
     }
 }
 
@@ -138,12 +142,31 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 ";
 
+    const TRIANGLE_WGSL: &str = r"
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec4<f32>,
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = vec4<f32>(input.position, 1.0);
+    return output;
+}
+";
+
     #[test]
     fn wgsl_intrinsics_go_to_the_shared_section() {
         let module = naga::front::wgsl::parse_str(CAMERA_WGSL).expect("the shader should parse");
         let bindings = ShaderMetadata::new(&module)
             .expect("the shader should expose bindings")
-            .generate_bindings();
+            .generate_bindings()
+            .expect("vertex input reflection should succeed");
 
         // The vectors and matrices WGSL itself defines are shared by every shader,
         // so they are described once, under the shared section, as `st0`, `st1`, and
@@ -165,5 +188,84 @@ struct Camera {
         };
         assert_eq!(members[0].ty.as_str(), "st0");
         assert_eq!(members[1].ty.as_str(), "st1");
+    }
+
+    #[test]
+    fn vertex_pipeline_exposes_typed_attributes_and_matching_buffer_layout() {
+        let module =
+            naga::front::wgsl::parse_str(TRIANGLE_WGSL).expect("the triangle shader should parse");
+        let bindings = ShaderMetadata::new(&module)
+            .expect("the shader should expose bindings")
+            .generate_bindings()
+            .expect("the vertex input layout should be representable");
+        let vertex = bindings
+            .pipelines
+            .expect("the shader should expose a pipeline")
+            .vertex
+            .expect("the shader should expose a vertex stage");
+
+        assert_eq!(vertex.entry_point, "vs_main");
+        let buffers = vertex
+            .buffers
+            .expect("the vertex attributes should have a default buffer layout");
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].array_stride, 32);
+        assert_eq!(buffers[0].step_mode, crate::VertexStepMode::Vertex);
+        assert_eq!(buffers[0].attributes.len(), 2);
+
+        let position = &buffers[0].attributes[0];
+        assert_eq!(position.name, "position");
+        assert_eq!(position.shader_location, 0);
+        assert_eq!(position.format, crate::VertexFormat::Float32x3);
+        assert_eq!(position.offset, 0);
+        assert_eq!(position.ty.as_str(), "st0");
+
+        let color = &buffers[0].attributes[1];
+        assert_eq!(color.name, "color");
+        assert_eq!(color.shader_location, 1);
+        assert_eq!(color.format, crate::VertexFormat::Float32x4);
+        assert_eq!(color.offset, 16);
+        assert_eq!(color.ty.as_str(), "st1");
+
+        let json = serde_json::to_value(
+            ShaderMetadata::new(&module)
+                .expect("the shader should expose bindings")
+                .generate_bindings()
+                .expect("the vertex input layout should be representable"),
+        )
+        .expect("the schema should serialize");
+        assert_eq!(
+            json["pipelines"]["vertex"]["buffers"][0]["array_stride"],
+            32
+        );
+        assert_eq!(
+            json["pipelines"]["vertex"]["buffers"][0]["attributes"][1]["shader_location"],
+            1
+        );
+        assert_eq!(
+            json["pipelines"]["vertex"]["buffers"][0]["attributes"][1]["format"],
+            "Float32x4"
+        );
+    }
+
+    #[test]
+    fn unsupported_vertex_formats_remain_visible_without_a_guessed_layout() {
+        let module = naga::front::wgsl::parse_str(
+            r"
+@vertex
+fn vs_main(@location(0) enabled: bool) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+",
+        )
+        .expect("the shader should parse");
+        let bindings = ShaderMetadata::new(&module)
+            .expect("the shader should expose bindings")
+            .generate_bindings()
+            .expect("logical shader inputs should still be reflected");
+        let vertex = bindings.pipelines.unwrap().vertex.unwrap();
+        assert_eq!(vertex.inputs.len(), 1);
+        assert_eq!(vertex.inputs[0].format, None);
+        assert!(vertex.buffers.is_none());
     }
 }
