@@ -167,10 +167,13 @@ pub struct VertexAttribute {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VertexInput {
     pub name: String,
-    pub shader_location: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shader_location: Option<u32>,
     pub ty: crate::TypeId,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<VertexFormat>,
-    pub offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
 }
 
 /// Vertex formats representable by WebGPU's fixed-function vertex fetch.

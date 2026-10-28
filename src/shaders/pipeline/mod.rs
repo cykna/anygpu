@@ -36,6 +36,24 @@ impl<'a> ShaderMetadata<'a> {
         let mut inputs = Vec::new();
         let mut can_build_buffers = true;
         for argument in &entry.function.arguments {
+            if let Some(Binding::BuiltIn(_)) = argument.binding.as_ref() {
+                continue;
+            }
+            // Add input entry referencing the argument type
+            if let Some(type_id) = type_ids.get(&argument.ty) {
+                let location = match argument.binding.as_ref() {
+                    Some(Binding::Location { location, .. }) => Some(*location),
+                    _ => None,
+                };
+                inputs.push(VertexInput {
+                    name: argument.name.clone().unwrap_or_else(|| "input".to_string()),
+                    shader_location: location,
+                    ty: type_id.clone(),
+                    format: vertex_format(self.module, argument.ty),
+                    offset: None,
+                });
+            }
+
             let mut argument_inputs = Vec::new();
             self.collect_vertex_inputs(
                 argument.ty,
@@ -48,7 +66,6 @@ impl<'a> ShaderMetadata<'a> {
             if argument_inputs.is_empty() {
                 continue;
             }
-            inputs.extend(argument_inputs.iter().cloned());
             if argument_inputs.iter().any(|input| input.format.is_none()) {
                 can_build_buffers = false;
                 continue;
@@ -58,10 +75,10 @@ impl<'a> ShaderMetadata<'a> {
                 .into_iter()
                 .map(|input| VertexAttribute {
                     name: input.name,
-                    shader_location: input.shader_location,
+                    shader_location: input.shader_location.expect("location required for buffer layout"),
                     ty: input.ty,
                     format: input.format.expect("checked above"),
-                    offset: input.offset,
+                    offset: input.offset.expect("offset required for buffer layout"),
                 })
                 .collect();
             attributes.sort_by_key(|attribute| attribute.shader_location);
@@ -114,10 +131,10 @@ impl<'a> ShaderMetadata<'a> {
                 })?;
                 inputs.push(VertexInput {
                     name: name.unwrap_or("input").to_owned(),
-                    shader_location: *location,
+                    shader_location: Some(*location),
                     ty: type_id,
                     format: vertex_format(self.module, ty),
-                    offset: base_offset,
+                    offset: Some(base_offset),
                 });
                 return Ok(());
             }

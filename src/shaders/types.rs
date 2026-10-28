@@ -36,6 +36,8 @@ pub struct MemberDescriptor {
     pub name: String,
     pub offset: u32,
     pub ty: TypeId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -283,10 +285,17 @@ impl<'a> ShaderMetadata<'a> {
                 let layout = layout.expect("a struct is laid out when it is reached");
                 let members = members
                     .iter()
-                    .map(|m| MemberDescriptor {
-                        name: m.name.clone().unwrap_or_default(),
-                        offset: m.offset,
-                        ty: self.type_id(interner, memo, m.ty),
+                    .map(|m| {
+                        let location = match &m.binding {
+                            Some(naga::Binding::Location { location, .. }) => Some(*location),
+                            _ => None,
+                        };
+                        MemberDescriptor {
+                            name: m.name.clone().unwrap_or_default(),
+                            offset: m.offset,
+                            ty: self.type_id(interner, memo, m.ty),
+                            location,
+                        }
                     })
                     .collect();
                 let len: u32 = match layout.alignment {
