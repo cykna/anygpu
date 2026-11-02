@@ -1,10 +1,15 @@
 use std::collections::HashMap;
 
 use color_eyre::eyre::{Result, eyre};
-use naga::{AddressSpace, Binding, Handle, ScalarKind, ShaderStage, Type, TypeInner, VectorSize};
+use naga::{
+    AddressSpace, Binding, Handle, ScalarKind, ShaderStage as NagaShaderStage, Type, TypeInner,
+    VectorSize,
+};
 
 use crate::{
-    ComputeState, FragmentState, PipelineCompilationOptions, ShaderMetadata, StorageAccess,
+    ComputeState, FragmentState, InterfaceVariable, PipelineCompilationOptions, ShaderMetadata,
+    ShaderStage, StorageAccess, TypeInterner,
+    shaders::types::binding_attributes,
     types::{
         BindGroupLayout, BindGroupLayoutEntry, BufferBindingType, PipelineDescriptor,
         PipelineLayout, VertexAttribute, VertexBufferLayout, VertexFormat, VertexInput,
@@ -28,7 +33,7 @@ impl<'a> ShaderMetadata<'a> {
             .module
             .entry_points
             .iter()
-            .find(|entry| entry.stage == ShaderStage::Vertex)
+            .find(|entry| entry.stage == NagaShaderStage::Vertex)
         else {
             return Ok(None);
         };
@@ -75,7 +80,9 @@ impl<'a> ShaderMetadata<'a> {
                 .into_iter()
                 .map(|input| VertexAttribute {
                     name: input.name,
-                    shader_location: input.shader_location.expect("location required for buffer layout"),
+                    shader_location: input
+                        .shader_location
+                        .expect("location required for buffer layout"),
                     ty: input.ty,
                     format: input.format.expect("checked above"),
                     offset: input.offset.expect("offset required for buffer layout"),
@@ -103,6 +110,16 @@ impl<'a> ShaderMetadata<'a> {
                 attributes,
             });
         }
+        let mut outputs = Vec::new();
+        if let Some(result) = &entry.function.result {
+            self.collect_interface_variables(
+                result.ty,
+                result.binding.as_ref(),
+                Some("output"),
+                type_ids,
+                &mut outputs,
+            )?;
+        }
         Ok(Some(VertexState {
             entry_point: entry.name.clone(),
             compilation_options: PipelineCompilationOptions {
@@ -110,6 +127,7 @@ impl<'a> ShaderMetadata<'a> {
                 zero_initialize_workgroup_memory: false,
             },
             inputs,
+            outputs,
             buffers: can_build_buffers.then_some(buffers),
         }))
     }
@@ -163,26 +181,109 @@ impl<'a> ShaderMetadata<'a> {
         }
     }
 
-    pub fn get_fragment(&self) -> Option<FragmentState> {
-        self.module.entry_points.iter().find_map(|entry| {
-            if entry.stage == ShaderStage::Fragment {
-                let out = FragmentState {
-                    entry_point: entry.name.clone(),
-                    compilation_options: PipelineCompilationOptions {
-                        constants: HashMap::new(),
-                        zero_initialize_workgroup_memory: false,
-                    },
-                };
-                Some(out)
-            } else {
-                None
+    fn collect_interface_variables(
+        &self,
+        ty: Handle<Type>,
+        binding: Option<&Binding>,
+        name: Option<&str>,
+        type_ids: &HashMap<Handle<Type>, crate::TypeId>,
+        variables: &mut Vec<InterfaceVariable>,
+    ) -> Result<()> {
+        if matches!(
+            binding,
+            Some(Binding::Location { .. }) | Some(Binding::BuiltIn(_))
+        ) {
+            let type_id = type_ids.get(&ty).cloned().ok_or_else(|| {
+                eyre!(
+                    "interface type `{}` was not interned",
+                    self.get_type_name(ty)
+                )
+            })?;
+            let attributes = binding_attributes(binding);
+            variables.push(InterfaceVariable {
+                name: name.unwrap_or("value").to_owned(),
+                ty: type_id,
+                location: attributes.location,
+                builtin: attributes.builtin,
+                interpolation: attributes.interpolation,
+                sampling: attributes.sampling,
+                invariant: attributes.invariant,
+            });
+            return Ok(());
+        }
+
+        match &self.module.types[ty].inner {
+            TypeInner::Struct { members, .. } => {
+                for member in members {
+                    let member_name = member.name.as_deref().or(name);
+                    self.collect_interface_variables(
+                        member.ty,
+                        member.binding.as_ref(),
+                        member_name,
+                        type_ids,
+                        variables,
+                    )?;
+                }
+                Ok(())
             }
-        })
+            _ => Err(eyre!(
+                "interface value `{}` has no location or builtin binding",
+                name.unwrap_or("unnamed")
+            )),
+        }
+    }
+
+    pub fn get_fragment(&self) -> Option<FragmentState> {
+        let (_, type_ids) = self.get_types_with_ids();
+        self.get_fragment_with_ids(&type_ids).ok().flatten()
+    }
+
+    fn get_fragment_with_ids(
+        &self,
+        type_ids: &HashMap<Handle<Type>, crate::TypeId>,
+    ) -> Result<Option<FragmentState>> {
+        let Some(entry) = self
+            .module
+            .entry_points
+            .iter()
+            .find(|entry| entry.stage == NagaShaderStage::Fragment)
+        else {
+            return Ok(None);
+        };
+        let mut inputs = Vec::new();
+        for argument in &entry.function.arguments {
+            self.collect_interface_variables(
+                argument.ty,
+                argument.binding.as_ref(),
+                argument.name.as_deref(),
+                type_ids,
+                &mut inputs,
+            )?;
+        }
+        let mut outputs = Vec::new();
+        if let Some(result) = &entry.function.result {
+            self.collect_interface_variables(
+                result.ty,
+                result.binding.as_ref(),
+                Some("output"),
+                type_ids,
+                &mut outputs,
+            )?;
+        }
+        Ok(Some(FragmentState {
+            entry_point: entry.name.clone(),
+            compilation_options: PipelineCompilationOptions {
+                constants: HashMap::new(),
+                zero_initialize_workgroup_memory: false,
+            },
+            inputs,
+            outputs,
+        }))
     }
 
     pub fn get_compute(&self) -> Option<ComputeState> {
         self.module.entry_points.iter().find_map(|entry| {
-            if entry.stage == ShaderStage::Compute {
+            if entry.stage == NagaShaderStage::Compute {
                 let out = ComputeState {
                     entry_point: entry.name.clone(),
                     compilation_options: PipelineCompilationOptions {
@@ -197,9 +298,44 @@ impl<'a> ShaderMetadata<'a> {
         })
     }
 
+    /// The stages whose entry points actually use `global`, directly or through
+    /// a function they call. Naga's validation already folds callee usage into
+    /// each entry point's `global_uses`, so a helper's accesses are included.
+    fn visibility(&self, global: Handle<naga::GlobalVariable>) -> Vec<ShaderStage> {
+        let mut visibility = Vec::new();
+        for (index, entry) in self.module.entry_points.iter().enumerate() {
+            let used = match &self.module_info {
+                Some(info) => !info.get_entry_point(index)[global].is_empty(),
+                None => function_uses_global(self.module, &entry.function, global),
+            };
+            if !used {
+                continue;
+            }
+            let stage = match entry.stage {
+                NagaShaderStage::Vertex => ShaderStage::Vertex,
+                NagaShaderStage::Fragment => ShaderStage::Fragment,
+                NagaShaderStage::Compute => ShaderStage::Compute,
+                _ => continue,
+            };
+            if !visibility.contains(&stage) {
+                visibility.push(stage);
+            }
+        }
+        // A stable order keeps the schema identical across runs, regardless of
+        // the order the entry points happen to be declared in.
+        visibility.sort_by_key(|stage| match stage {
+            ShaderStage::Vertex => 0,
+            ShaderStage::Fragment => 1,
+            ShaderStage::Compute => 2,
+        });
+        visibility
+    }
+
     pub fn get_bindgroups(&self) -> Vec<BindGroupLayout> {
         let mut bindings: Vec<BindGroupLayout> = Vec::new();
-        for (_, global) in self.module.global_variables.iter() {
+        let (types, types_mapping) = self.get_types_with_ids();
+
+        for (handle, global) in self.module.global_variables.iter() {
             if let Some(bind) = global.binding {
                 let index = bind.group as usize;
                 // Groups do not have to be declared in order, so the layouts are
@@ -222,15 +358,23 @@ impl<'a> ShaderMetadata<'a> {
                 bindings[index].entries.push(BindGroupLayoutEntry {
                     binding: bind.binding,
                     name: global.name.clone().unwrap(),
-                    visibility: vec![],
+                    visibility: self.visibility(handle),
                     count: None,
                     ty: types::BindingType::Buffer {
                         buffer_type,
                         has_dynamic_offset: false,
-                        min_binding_size: None,
+                        // The layouter reports a runtime-sized array as one
+                        // element, which is exactly the minimum a binding of that
+                        // type must provide. A fixed type reports its full size.
+                        min_binding_size: Some(u64::from(self.layouter[global.ty].size)),
+                        ty: types_mapping.get(&global.ty).unwrap().to_string(),
                     },
                 });
             }
+        }
+        // The shader may declare bindings in any order; the layout does not.
+        for group in &mut bindings {
+            group.entries.sort_by_key(|entry| entry.binding);
         }
         bindings
     }
@@ -249,10 +393,51 @@ impl<'a> ShaderMetadata<'a> {
                 push_constant_ranges: vec![],
             },
             vertex: self.get_vertex_with_ids(type_ids)?,
-            fragment: self.get_fragment(),
+            fragment: self.get_fragment_with_ids(type_ids)?,
             compute: self.get_compute(),
         })
     }
+}
+
+/// A best-effort IR walk for modules naga could not validate. Expressions hold
+/// direct global references and calls point at the callee, so following both
+/// gives the same transitive answer `ModuleInfo` would have provided.
+fn function_uses_global(
+    module: &naga::Module,
+    function: &naga::Function,
+    global: Handle<naga::GlobalVariable>,
+) -> bool {
+    if function.expressions.iter().any(|(_, expression)| {
+        matches!(expression, naga::Expression::GlobalVariable(handle) if *handle == global)
+    }) {
+        return true;
+    }
+    block_uses_global(module, &function.body, global)
+}
+
+fn block_uses_global(
+    module: &naga::Module,
+    block: &naga::Block,
+    global: Handle<naga::GlobalVariable>,
+) -> bool {
+    block.iter().any(|statement| match statement {
+        naga::Statement::Block(block) => block_uses_global(module, block, global),
+        naga::Statement::If { accept, reject, .. } => {
+            block_uses_global(module, accept, global) || block_uses_global(module, reject, global)
+        }
+        naga::Statement::Switch { cases, .. } => cases
+            .iter()
+            .any(|case| block_uses_global(module, &case.body, global)),
+        naga::Statement::Loop {
+            body, continuing, ..
+        } => {
+            block_uses_global(module, body, global) || block_uses_global(module, continuing, global)
+        }
+        naga::Statement::Call { function, .. } => {
+            function_uses_global(module, &module.functions[*function], global)
+        }
+        _ => false,
+    })
 }
 
 fn vertex_format(module: &naga::Module, handle: Handle<Type>) -> Option<VertexFormat> {

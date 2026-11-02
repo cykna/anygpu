@@ -21,7 +21,7 @@ use crate::StorageAccess;
 ///
 /// `wgpu` models this as a `ShaderStages` bitmask; a `Vec` keeps the JSON
 /// readable, and an empty one is the same as "not visible to any stage".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShaderStage {
     Vertex,
     Fragment,
@@ -49,6 +49,7 @@ pub enum BindingType {
         buffer_type: BufferBindingType,
         has_dynamic_offset: bool,
         min_binding_size: Option<u64>,
+        ty: String,
     },
     Sampler(SamplerBindingType),
     Texture {
@@ -176,6 +177,30 @@ pub struct VertexInput {
     pub offset: Option<u64>,
 }
 
+/// One value crossing an entry point's interface, flattened out of a struct when
+/// the shader groups several of them together. Unlike [`VertexInput`], this keeps
+/// builtins and interpolation qualifiers: it describes the shader's interface,
+/// not only the fixed-function vertex fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterfaceVariable {
+    pub name: String,
+    pub ty: crate::TypeId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<crate::Interpolation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<crate::Sampling>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invariant: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Vertex formats representable by WebGPU's fixed-function vertex fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VertexFormat {
@@ -218,6 +243,8 @@ pub struct VertexState {
     #[serde(default)]
     pub inputs: Vec<VertexInput>,
     #[serde(default)]
+    pub outputs: Vec<InterfaceVariable>,
+    #[serde(default)]
     pub buffers: Option<Vec<VertexBufferLayout>>,
 }
 
@@ -227,6 +254,10 @@ pub struct VertexState {
 pub struct FragmentState {
     pub entry_point: String,
     pub compilation_options: PipelineCompilationOptions,
+    #[serde(default)]
+    pub inputs: Vec<InterfaceVariable>,
+    #[serde(default)]
+    pub outputs: Vec<InterfaceVariable>,
 }
 
 /// Mirrors `wgpu::ComputeState`, minus `module`.

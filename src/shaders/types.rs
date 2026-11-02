@@ -31,6 +31,106 @@ impl ScalarInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Interpolation {
+    Perspective,
+    Linear,
+    Flat,
+    PerVertex,
+}
+
+impl From<naga::Interpolation> for Interpolation {
+    fn from(value: naga::Interpolation) -> Self {
+        match value {
+            naga::Interpolation::Perspective => Self::Perspective,
+            naga::Interpolation::Linear => Self::Linear,
+            naga::Interpolation::Flat => Self::Flat,
+            naga::Interpolation::PerVertex => Self::PerVertex,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Sampling {
+    Center,
+    Centroid,
+    Sample,
+    First,
+    Either,
+}
+
+impl From<naga::Sampling> for Sampling {
+    fn from(value: naga::Sampling) -> Self {
+        match value {
+            naga::Sampling::Center => Self::Center,
+            naga::Sampling::Centroid => Self::Centroid,
+            naga::Sampling::Sample => Self::Sample,
+            naga::Sampling::First => Self::First,
+            naga::Sampling::Either => Self::Either,
+        }
+    }
+}
+
+/// The attributes that describe how a value crosses a shader stage boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BindingAttributes {
+    pub location: Option<u32>,
+    pub builtin: Option<String>,
+    pub interpolation: Option<Interpolation>,
+    pub sampling: Option<Sampling>,
+    pub invariant: bool,
+}
+
+pub(crate) fn binding_attributes(binding: Option<&naga::Binding>) -> BindingAttributes {
+    match binding {
+        Some(naga::Binding::BuiltIn(builtin)) => BindingAttributes {
+            location: None,
+            builtin: Some(builtin_name(builtin)),
+            interpolation: None,
+            sampling: None,
+            invariant: matches!(builtin, naga::BuiltIn::Position { invariant: true }),
+        },
+        Some(naga::Binding::Location {
+            location,
+            interpolation,
+            sampling,
+            ..
+        }) => BindingAttributes {
+            location: Some(*location),
+            builtin: None,
+            interpolation: interpolation.map(Into::into),
+            sampling: sampling.map(Into::into),
+            invariant: false,
+        },
+        None => BindingAttributes::default(),
+    }
+}
+
+/// The WGSL spelling of a builtin, e.g. `Position` becomes `position`.
+pub(crate) fn builtin_name(builtin: &naga::BuiltIn) -> String {
+    let debug = format!("{builtin:?}");
+    let variant = debug.split([' ', '{']).next().unwrap_or(debug.as_str());
+    let chars: Vec<char> = variant.chars().collect();
+    let mut name = String::with_capacity(variant.len() + 4);
+    for (index, ch) in chars.iter().enumerate() {
+        if ch.is_ascii_uppercase() {
+            let previous = index.checked_sub(1).map(|index| chars[index]);
+            let next = chars.get(index + 1).copied();
+            let boundary = index > 0
+                && (previous.is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+                    || (previous.is_some_and(|ch| ch.is_ascii_uppercase())
+                        && next.is_some_and(|ch| ch.is_ascii_lowercase())));
+            if boundary {
+                name.push('_');
+            }
+            name.push(ch.to_ascii_lowercase());
+        } else {
+            name.push(*ch);
+        }
+    }
+    name
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberDescriptor {
     pub name: String,
@@ -38,6 +138,18 @@ pub struct MemberDescriptor {
     pub ty: TypeId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<Interpolation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invariant: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -120,6 +232,88 @@ pub struct TypeInfo {
     pub id: TypeId,
     pub name: String,
     pub descriptor: TypeDescriptor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeclarationIdentity {
+    pub module_path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkedTypeReference {
+    Canonical(TypeId),
+    Local { module_id: String, type_id: TypeId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedMemberDescriptor {
+    pub name: String,
+    pub offset: u32,
+    pub ty: LinkedTypeReference,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<Interpolation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invariant: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkedTypeDescriptor {
+    Scalar {
+        scalar: ScalarInfo,
+    },
+    Vector {
+        length: u8,
+        scalar: ScalarInfo,
+    },
+    Matrix {
+        columns: u8,
+        rows: u8,
+        scalar: ScalarInfo,
+    },
+    Atomic {
+        scalar: ScalarInfo,
+    },
+    Array {
+        base: LinkedTypeReference,
+        size: Option<u32>,
+        stride: u32,
+    },
+    BindingArray {
+        base: LinkedTypeReference,
+        size: Option<u32>,
+    },
+    Struct {
+        size: u32,
+        alignment: u32,
+        members: Vec<LinkedMemberDescriptor>,
+    },
+    Pointer {
+        base: LinkedTypeReference,
+    },
+    Sampler {
+        comparison: bool,
+    },
+    Image {
+        dimension: ImageDimension,
+        arrayed: bool,
+        class: ImageClass,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedTypeInfo {
+    pub id: TypeId,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<DeclarationIdentity>,
+    pub descriptor: LinkedTypeDescriptor,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -286,15 +480,16 @@ impl<'a> ShaderMetadata<'a> {
                 let members = members
                     .iter()
                     .map(|m| {
-                        let location = match &m.binding {
-                            Some(naga::Binding::Location { location, .. }) => Some(*location),
-                            _ => None,
-                        };
+                        let attributes = binding_attributes(m.binding.as_ref());
                         MemberDescriptor {
                             name: m.name.clone().unwrap_or_default(),
                             offset: m.offset,
                             ty: self.type_id(interner, memo, m.ty),
-                            location,
+                            location: attributes.location,
+                            builtin: attributes.builtin,
+                            interpolation: attributes.interpolation,
+                            sampling: attributes.sampling,
+                            invariant: attributes.invariant,
                         }
                     })
                     .collect();
@@ -409,7 +604,7 @@ impl<'a> ShaderMetadata<'a> {
                     match size {
                         ArraySize::Constant(n) => format!("array<{}, {}>", base_name, n),
                         ArraySize::Dynamic => format!("array<{}>", base_name),
-                        ArraySize::Pending(_) => format!("array<pending>"),
+                        ArraySize::Pending(_) => "array<pending>".to_string(),
                     }
                 }
 
@@ -434,7 +629,7 @@ impl<'a> ShaderMetadata<'a> {
                     match size {
                         ArraySize::Constant(n) => format!("binding_array<{}, {}>", base_name, n),
                         ArraySize::Dynamic => format!("binding_array<{}>", base_name),
-                        ArraySize::Pending(_) => format!("binding_array<pending>"),
+                        ArraySize::Pending(_) => "binding_array<pending>".to_string(),
                     }
                 }
 
