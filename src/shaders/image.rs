@@ -79,10 +79,10 @@ impl From<naga::StorageFormat> for StorageFormat {
             naga::StorageFormat::R8Snorm => Self::R8Snorm,
             naga::StorageFormat::R8Uint => Self::R8Uint,
             naga::StorageFormat::R8Sint => Self::R8Sint,
-            naga::StorageFormat::Rg8Snorm => Self::R16Unorm,
-            naga::StorageFormat::Rg8Unorm => Self::Rg16Unorm,
-            naga::StorageFormat::Rg8Uint => Self::Rgba16Unorm,
-            naga::StorageFormat::Rg8Sint => Self::R16Snorm,
+            naga::StorageFormat::Rg8Snorm => Self::Rg8Snorm,
+            naga::StorageFormat::Rg8Unorm => Self::Rg8Unorm,
+            naga::StorageFormat::Rg8Uint => Self::Rg8Uint,
+            naga::StorageFormat::Rg8Sint => Self::Rg8Sint,
             naga::StorageFormat::R32Uint => Self::R32Uint,
             naga::StorageFormat::Rgba8Snorm => Self::Rgba8Snorm,
             naga::StorageFormat::Rgba8Unorm => Self::Rgba8Unorm,
@@ -102,21 +102,31 @@ pub enum StorageAccess {
     /// A `read_write` storage buffer, which naga reports as `LOAD | STORE`.
     LoadStore,
     Atomic,
+    AtomicLoad,
+    AtomicStore,
+    AtomicLoadStore,
+    Unknown(u32),
 }
 
 impl From<naga::StorageAccess> for StorageAccess {
     fn from(value: naga::StorageAccess) -> Self {
-        // `naga::StorageAccess` is a set of flags, and the flags combine, so the
-        // pair is matched through a guard: `LOAD | STORE` written in a pattern
-        // would mean "LOAD or STORE" rather than "both".
-        match value {
-            naga::StorageAccess::LOAD => Self::Load,
-            naga::StorageAccess::STORE => Self::Store,
-            naga::StorageAccess::ATOMIC => Self::Atomic,
-            other if other == naga::StorageAccess::LOAD | naga::StorageAccess::STORE => {
-                Self::LoadStore
-            }
-            other => unreachable!("{other:?}"),
+        let bits = value.bits();
+        if bits & !0x7 != 0 {
+            return Self::Unknown(bits);
+        }
+        match (
+            value.contains(naga::StorageAccess::LOAD),
+            value.contains(naga::StorageAccess::STORE),
+            value.contains(naga::StorageAccess::ATOMIC),
+        ) {
+            (true, false, false) => Self::Load,
+            (false, true, false) => Self::Store,
+            (true, true, false) => Self::LoadStore,
+            (false, false, true) => Self::Atomic,
+            (true, false, true) => Self::AtomicLoad,
+            (false, true, true) => Self::AtomicStore,
+            (true, true, true) => Self::AtomicLoadStore,
+            (false, false, false) => Self::Unknown(0),
         }
     }
 }

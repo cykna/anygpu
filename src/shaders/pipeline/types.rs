@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::StorageAccess;
+use crate::{StorageAccess, TypeId};
 
 /// The stages a shader can run on.
 ///
@@ -67,6 +67,22 @@ pub enum BindingType {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceAddressSpace {
+    Uniform,
+    Storage,
+    Handle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceAccess {
+    Read,
+    Write,
+    ReadWrite,
+    Atomic,
+    NotApplicable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BufferBindingType {
     Uniform,
@@ -115,6 +131,9 @@ pub struct BindGroupLayoutEntry {
     pub name: String,
     pub visibility: Vec<ShaderStage>,
     pub ty: BindingType,
+    pub address_space: ResourceAddressSpace,
+    pub access: ResourceAccess,
+    pub resource_type: TypeId,
     /// `None` for a plain binding. `wgpu` uses `Option<NonZeroU32>` here; a
     /// plain `Option<u32>` keeps the JSON simple, at the cost of allowing a
     /// count of zero that `NonZeroU32` rules out.

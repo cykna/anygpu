@@ -5,14 +5,19 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ReflectedModule,
-    pipeline::types::{BindingType, PipelineDescriptor},
+    pipeline::types::{
+        BindGroupLayoutEntry, BindingType, ComputeState, FragmentState, PipelineDescriptor,
+        PushConstantRange, ResourceAccess, ResourceAddressSpace, ShaderStage, VertexState,
+    },
     types::{
         DeclarationIdentity, LinkedMemberDescriptor, LinkedTypeDescriptor, LinkedTypeInfo,
         LinkedTypeReference, MemberDescriptor, TypeDescriptor, TypeId, TypeInfo,
     },
 };
 
-pub const LINKED_SCHEMA_VERSION: u32 = 1;
+/// Version 2 adds all bound resources, their address/access metadata, and an
+/// explicit local-or-canonical type reference to each binding.
+pub const LINKED_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedSchema {
@@ -26,8 +31,40 @@ pub struct LinkedModule {
     pub id: String,
     pub types: Vec<LinkedTypeInfo>,
     pub local_to_canonical: BTreeMap<TypeId, TypeId>,
-    pub pipelines: Option<PipelineDescriptor>,
-    pub bindgroups: Vec<super::pipeline::types::BindGroupLayoutEntry>,
+    pub pipelines: Option<LinkedPipelineDescriptor>,
+    pub bindgroups: Vec<LinkedBindGroupLayoutEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedPipelineDescriptor {
+    pub layout: LinkedPipelineLayout,
+    pub vertex: Option<VertexState>,
+    pub fragment: Option<FragmentState>,
+    pub compute: Option<ComputeState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedPipelineLayout {
+    pub bind_group_layouts: Vec<LinkedBindGroupLayout>,
+    pub push_constant_ranges: Vec<PushConstantRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedBindGroupLayout {
+    pub group: u32,
+    pub entries: Vec<LinkedBindGroupLayoutEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedBindGroupLayoutEntry {
+    pub binding: u32,
+    pub name: String,
+    pub visibility: Vec<ShaderStage>,
+    pub ty: BindingType,
+    pub address_space: ResourceAddressSpace,
+    pub access: ResourceAccess,
+    pub resource_type: LinkedTypeReference,
+    pub count: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -198,12 +235,15 @@ pub fn link_modules(mut modules: Vec<ReflectedModule>) -> Result<LinkedSchema, L
                 .collect::<Vec<_>>();
             types.sort_by(|left, right| left.id.cmp(&right.id));
 
-            let mut pipelines = module.bindings.pipelines.clone();
-            if let Some(pipelines) = &mut pipelines {
-                remap_pipeline(pipelines, &local_to_canonical[index]);
-            }
-            let mut bindgroups = module.bindings.bindgroups.clone();
-            remap_bindgroups(&mut bindgroups, &local_to_canonical[index]);
+            let pipelines =
+                module.bindings.pipelines.as_ref().map(|pipeline| {
+                    link_pipeline(pipeline, &module.id, &local_to_canonical[index])
+                });
+            let bindgroups = link_bindgroup_entries(
+                &module.bindings.bindgroups,
+                &module.id,
+                &local_to_canonical[index],
+            );
 
             LinkedModule {
                 id: module.id.clone(),
@@ -456,26 +496,71 @@ fn remap_type_id(id: &mut TypeId, local_to_canonical: &BTreeMap<TypeId, TypeId>)
     }
 }
 
-fn remap_bindgroups(
-    bindgroups: &mut [super::pipeline::types::BindGroupLayoutEntry],
+fn link_bindgroup_entries(
+    entries: &[BindGroupLayoutEntry],
+    module_id: &str,
     local_to_canonical: &BTreeMap<TypeId, TypeId>,
-) {
-    for entry in bindgroups {
-        if let BindingType::Buffer { ty, .. } = &mut entry.ty {
-            if let Some(canonical) = local_to_canonical.get(&TypeId(ty.clone())) {
-                *ty = canonical.to_string();
-            }
-        }
+) -> Vec<LinkedBindGroupLayoutEntry> {
+    entries
+        .iter()
+        .map(|entry| link_bindgroup_entry(entry, module_id, local_to_canonical))
+        .collect()
+}
+
+fn link_bindgroup_entry(
+    entry: &BindGroupLayoutEntry,
+    module_id: &str,
+    local_to_canonical: &BTreeMap<TypeId, TypeId>,
+) -> LinkedBindGroupLayoutEntry {
+    let mut ty = entry.ty.clone();
+    if let BindingType::Buffer { ty, .. } = &mut ty
+        && let Some(canonical) = local_to_canonical.get(&TypeId(ty.clone()))
+    {
+        *ty = canonical.to_string();
+    }
+
+    LinkedBindGroupLayoutEntry {
+        binding: entry.binding,
+        name: entry.name.clone(),
+        visibility: entry.visibility.clone(),
+        ty,
+        address_space: entry.address_space,
+        access: entry.access,
+        resource_type: link_reference(&entry.resource_type, module_id, local_to_canonical),
+        count: entry.count,
     }
 }
 
-fn remap_pipeline(
+fn link_pipeline(
+    pipeline: &PipelineDescriptor,
+    module_id: &str,
+    local_to_canonical: &BTreeMap<TypeId, TypeId>,
+) -> LinkedPipelineDescriptor {
+    let mut states = pipeline.clone();
+    remap_pipeline_states(&mut states, local_to_canonical);
+    LinkedPipelineDescriptor {
+        layout: LinkedPipelineLayout {
+            bind_group_layouts: pipeline
+                .layout
+                .bind_group_layouts
+                .iter()
+                .map(|group| LinkedBindGroupLayout {
+                    group: group.group,
+                    entries: link_bindgroup_entries(&group.entries, module_id, local_to_canonical),
+                })
+                .collect(),
+            push_constant_ranges: pipeline.layout.push_constant_ranges.clone(),
+        },
+        vertex: states.vertex,
+        fragment: states.fragment,
+        compute: states.compute,
+    }
+}
+
+fn remap_pipeline_states(
     pipeline: &mut PipelineDescriptor,
     local_to_canonical: &BTreeMap<TypeId, TypeId>,
 ) {
-    for group in &mut pipeline.layout.bind_group_layouts {
-        remap_bindgroups(&mut group.entries, local_to_canonical);
-    }
     if let Some(vertex) = &mut pipeline.vertex {
         for input in &mut vertex.inputs {
             remap_type_id(&mut input.ty, local_to_canonical);
@@ -679,6 +764,79 @@ struct Frame {
                 .modules
                 .iter()
                 .all(|module| module.types.iter().any(|ty| ty.name == "Camera"))
+        );
+    }
+
+    #[test]
+    fn linked_bindings_reference_canonical_buffers_and_module_local_images() {
+        let camera_with_bindings = |texture: &str, sampler: &str, texture_type: &str| {
+            format!(
+                r"
+struct Camera {{ view: mat4x4<f32>, }}
+@group(0) @binding(0) var<uniform> camera: Camera;
+@group(0) @binding(1) var {texture}: {texture_type};
+@group(0) @binding(2) var {sampler}: sampler;
+"
+            )
+        };
+        let identity = [("Camera", "package::common", "Camera")];
+        let schema = link_modules(vec![
+            reflected(
+                "package::first",
+                &camera_with_bindings("albedo", "linear_sampler", "texture_2d<f32>"),
+                &identity,
+            ),
+            reflected(
+                "package::second",
+                &camera_with_bindings("environment", "shadow_sampler", "texture_cube<i32>"),
+                &identity,
+            ),
+        ])
+        .expect("module resources should link independently");
+
+        assert_eq!(canonical_named(&schema, "Camera").len(), 1);
+        for module in &schema.modules {
+            let entries = &module
+                .pipelines
+                .as_ref()
+                .expect("reflected pipeline")
+                .layout
+                .bind_group_layouts[0]
+                .entries;
+            assert_eq!(entries.len(), 3);
+            assert!(matches!(
+                &entries[0].resource_type,
+                LinkedTypeReference::Canonical(_)
+            ));
+            for entry in &entries[1..] {
+                let LinkedTypeReference::Local { module_id, type_id } = &entry.resource_type else {
+                    panic!("image and sampler types should stay module-local");
+                };
+                assert_eq!(module_id, &module.id);
+                assert!(module.types.iter().any(|ty| &ty.id == type_id));
+            }
+        }
+        assert_eq!(
+            schema.modules[0]
+                .pipelines
+                .as_ref()
+                .unwrap()
+                .layout
+                .bind_group_layouts[0]
+                .entries[1]
+                .name,
+            "albedo"
+        );
+        assert_eq!(
+            schema.modules[1]
+                .pipelines
+                .as_ref()
+                .unwrap()
+                .layout
+                .bind_group_layouts[0]
+                .entries[1]
+                .name,
+            "environment"
         );
     }
 }

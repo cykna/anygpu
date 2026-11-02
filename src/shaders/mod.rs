@@ -11,6 +11,15 @@ use crate::shaders::{
     pipeline::types::{BindGroupLayoutEntry, PipelineDescriptor},
     types::{DeclarationIdentity, TypeInfo, TypeInterner},
 };
+
+/// Version 2 adds resource address space, access mode, and reflected type id to
+/// bind group entries.
+pub const SHADER_BINDINGS_SCHEMA_VERSION: u32 = 2;
+
+fn legacy_shader_bindings_schema_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SharedTypes {
     #[serde(default)]
@@ -19,6 +28,8 @@ pub struct SharedTypes {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ShaderBindings {
+    #[serde(default = "legacy_shader_bindings_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub types: Vec<TypeInfo>,
     #[serde(default)]
@@ -131,6 +142,14 @@ impl<'a> ShaderMetadata<'a> {
     }
 
     pub fn generate_bindings(self) -> color_eyre::Result<ShaderBindings> {
+        self.generate_bindings_for_module(None)
+    }
+
+    fn generate_bindings_for_module(
+        self,
+        module_id: Option<&str>,
+    ) -> color_eyre::Result<ShaderBindings> {
+        self.validate_bound_resources(module_id)?;
         let (types, type_ids) = self.get_types_with_ids();
         // The types intrinsic to WGSL itself - vectors, scalars, matrices - are
         // shared by every shader, so they are described once, under the shared
@@ -144,8 +163,9 @@ impl<'a> ShaderMetadata<'a> {
                 shader_types.push(ty);
             }
         }
-        let pipelines = self.get_pipeline_with_ids(&type_ids)?;
+        let pipelines = self.get_pipeline_with_ids(&type_ids, module_id)?;
         Ok(ShaderBindings {
+            schema_version: SHADER_BINDINGS_SCHEMA_VERSION,
             types: shader_types,
             shared: Some(SharedTypes {
                 types: shared_types,
@@ -160,6 +180,7 @@ impl<'a> ShaderMetadata<'a> {
         id: String,
         identities: HashMap<Handle<Type>, DeclarationIdentity>,
     ) -> color_eyre::Result<ReflectedModule> {
+        self.validate_bound_resources(Some(&id))?;
         let (_, type_ids) = self.get_types_with_ids();
         let identities = identities
             .into_iter()
@@ -169,7 +190,7 @@ impl<'a> ShaderMetadata<'a> {
                     .map(|type_id| (type_id.clone(), identity))
             })
             .collect();
-        let bindings = self.generate_bindings()?;
+        let bindings = self.generate_bindings_for_module(Some(&id))?;
 
         Ok(ReflectedModule {
             id,
@@ -284,6 +305,47 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 ";
 
+    const ALL_RESOURCE_TYPES_WGSL: &str = r"
+requires readonly_and_readwrite_storage_textures;
+
+struct Params {
+    factor: f32,
+}
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> read_data: array<u32>;
+@group(0) @binding(2) var sampled: texture_2d<f32>;
+@group(0) @binding(3) var tex_sampler: sampler;
+@group(0) @binding(4) var depth_tex: texture_depth_2d;
+@group(0) @binding(5) var read_tex: texture_storage_2d<rgba8unorm, read>;
+@group(0) @binding(6) var write_tex: texture_storage_2d<rg8unorm, write>;
+@group(0) @binding(7) var read_write_tex: texture_storage_2d<rgba8unorm, read_write>;
+@group(0) @binding(8) var array_tex: texture_2d_array<f32>;
+@group(0) @binding(9) var compare_sampler: sampler_comparison;
+
+@vertex
+fn vs_main() -> @builtin(position) vec4<f32> {
+    return vec4<f32>(params.factor);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    let color = textureSampleLevel(sampled, tex_sampler, vec2<f32>(0.0), 0.0);
+    let depth = textureLoad(depth_tex, vec2<i32>(0), 0);
+    let comparison = textureSampleCompare(depth_tex, compare_sampler, vec2<f32>(0.0), 0.5);
+    let array_color = textureLoad(array_tex, vec2<i32>(0), 0, 0);
+    return color + array_color + vec4<f32>(depth + comparison + params.factor);
+}
+
+@compute @workgroup_size(1)
+fn cs_main() {
+    let read_color = textureLoad(read_tex, vec2<i32>(0));
+    let current_color = textureLoad(read_write_tex, vec2<i32>(0));
+    textureStore(write_tex, vec2<i32>(0), read_color + current_color);
+    textureStore(read_write_tex, vec2<i32>(0), read_color + current_color);
+    let value = read_data[0];
+}
+";
+
     const INTERFACE_ATTRIBUTES_WGSL: &str = r"
 struct Attributes {
     @builtin(position) @invariant position: vec4<f32>,
@@ -311,6 +373,21 @@ fn vs_main() -> Attributes {
             .iter()
             .find(|entry| entry.binding == binding)
             .expect("the binding should be reflected")
+    }
+
+    fn all_reflected_type<'a>(bindings: &'a ShaderBindings, id: &crate::TypeId) -> &'a TypeInfo {
+        bindings
+            .types
+            .iter()
+            .chain(
+                bindings
+                    .shared
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|shared| &shared.types),
+            )
+            .find(|ty| &ty.id == id)
+            .expect("resource type should be in the reflected type table")
     }
 
     #[test]
@@ -358,12 +435,164 @@ fn vs_main() -> Attributes {
 
         let json = serde_json::to_value(&bindings).expect("the schema should serialize");
         assert_eq!(
+            json["schema_version"],
+            crate::SHADER_BINDINGS_SCHEMA_VERSION
+        );
+        assert_eq!(
             json["pipelines"]["layout"]["bind_group_layouts"][0]["entries"][0]["visibility"][0],
             "Vertex"
         );
         assert_eq!(
             json["pipelines"]["layout"]["bind_group_layouts"][0]["entries"][0]["ty"]["Buffer"]["min_binding_size"],
             256
+        );
+    }
+
+    #[test]
+    fn all_binding_kinds_keep_metadata_and_reference_reflected_types() {
+        let module = naga::front::wgsl::parse_str(ALL_RESOURCE_TYPES_WGSL)
+            .expect("all supported resource kinds should parse");
+        let bindings = ShaderMetadata::new(&module)
+            .expect("all supported resource kinds should reflect")
+            .generate_bindings()
+            .expect("all supported resource kinds should emit layouts");
+        let layouts = &bindings
+            .pipelines
+            .as_ref()
+            .unwrap()
+            .layout
+            .bind_group_layouts;
+
+        assert_eq!(layouts[0].entries.len(), 10);
+        let params = entry(layouts, 0, 0);
+        assert_eq!(
+            params.visibility,
+            vec![crate::ShaderStage::Vertex, crate::ShaderStage::Fragment]
+        );
+        assert_eq!(params.address_space, crate::ResourceAddressSpace::Uniform);
+        assert_eq!(params.access, crate::ResourceAccess::Read);
+
+        let read_data = entry(layouts, 0, 1);
+        assert_eq!(
+            read_data.address_space,
+            crate::ResourceAddressSpace::Storage
+        );
+        assert_eq!(read_data.access, crate::ResourceAccess::Read);
+        let sampled = entry(layouts, 0, 2);
+        assert_eq!(sampled.visibility, vec![crate::ShaderStage::Fragment]);
+        assert_eq!(sampled.address_space, crate::ResourceAddressSpace::Handle);
+        assert_eq!(sampled.access, crate::ResourceAccess::Read);
+        assert!(matches!(
+            &sampled.ty,
+            crate::BindingType::Texture {
+                sample_type: crate::TextureSampleType::Float { filterable: true },
+                view_dimension: crate::TextureViewDimension::D2,
+                multisampled: false,
+            }
+        ));
+        assert!(matches!(
+            &entry(layouts, 0, 3).ty,
+            crate::BindingType::Sampler(crate::SamplerBindingType::Filtering)
+        ));
+        assert!(matches!(
+            &entry(layouts, 0, 4).ty,
+            crate::BindingType::Texture {
+                sample_type: crate::TextureSampleType::Depth,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &entry(layouts, 0, 5).ty,
+            crate::BindingType::StorageTexture {
+                access: crate::StorageTextureAccess::ReadOnly,
+                format,
+                ..
+            } if format == "rgba8unorm"
+        ));
+        assert_eq!(entry(layouts, 0, 5).access, crate::ResourceAccess::Read);
+        assert!(matches!(
+            &entry(layouts, 0, 6).ty,
+            crate::BindingType::StorageTexture {
+                access: crate::StorageTextureAccess::WriteOnly,
+                format,
+                ..
+            } if format == "rg8unorm"
+        ));
+        assert_eq!(entry(layouts, 0, 6).access, crate::ResourceAccess::Write);
+        let write_texture_type = all_reflected_type(&bindings, &entry(layouts, 0, 6).resource_type);
+        assert!(matches!(
+            &write_texture_type.descriptor,
+            TypeDescriptor::Image {
+                class: crate::ImageClass::Storage {
+                    format: crate::StorageFormat::Rg8Unorm,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &entry(layouts, 0, 7).ty,
+            crate::BindingType::StorageTexture {
+                access: crate::StorageTextureAccess::ReadWrite,
+                ..
+            }
+        ));
+        assert_eq!(
+            entry(layouts, 0, 7).access,
+            crate::ResourceAccess::ReadWrite
+        );
+        assert!(matches!(
+            &entry(layouts, 0, 8).ty,
+            crate::BindingType::Texture {
+                view_dimension: crate::TextureViewDimension::D2Array,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &entry(layouts, 0, 9).ty,
+            crate::BindingType::Sampler(crate::SamplerBindingType::Comparison)
+        ));
+
+        let all_types = bindings
+            .types
+            .iter()
+            .chain(
+                bindings
+                    .shared
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|shared| &shared.types),
+            )
+            .collect::<Vec<_>>();
+        for resource in &layouts[0].entries {
+            assert!(
+                all_types.iter().any(|ty| ty.id == resource.resource_type),
+                "resource `{}` must reference a reflected type",
+                resource.name
+            );
+        }
+    }
+
+    #[test]
+    fn binding_arrays_fail_with_resource_context_instead_of_being_dropped() {
+        let source = r"
+enable wgpu_binding_array;
+@group(2) @binding(7) var textures: binding_array<texture_2d<f32>, 4>;
+@compute @workgroup_size(1) fn main() {}
+";
+        let module =
+            naga::front::wgsl::parse_str(source).expect("binding array shader should parse");
+        let error = ShaderMetadata::new(&module)
+            .expect("shader should reflect")
+            .generate_reflected_module("package::broken".to_owned(), HashMap::new())
+            .expect_err("binding arrays are not supported");
+        let message = error.to_string();
+        assert!(message.contains("package::broken"), "{message}");
+        assert!(message.contains("group 2 binding 7"), "{message}");
+        assert!(message.contains("BindingArray"), "{message}");
+        assert!(
+            message.contains("binding arrays are not supported"),
+            "{message}"
         );
     }
 

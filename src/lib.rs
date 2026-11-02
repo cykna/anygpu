@@ -3,6 +3,7 @@ pub use naga;
 pub use serde;
 pub use serde_json;
 pub use shaders::ReflectedModule;
+pub use shaders::SHADER_BINDINGS_SCHEMA_VERSION;
 pub use shaders::ShaderBindings;
 pub use shaders::ShaderMetadata;
 pub use shaders::image::*;
