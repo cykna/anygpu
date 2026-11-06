@@ -1,7 +1,10 @@
 use std::path::{Component, Path};
 
 use wesl::{
-    CompileOptions, EscapeMangler, Mangler, SourceMap, Wesl,
+    CompileOptions, Compiler,
+    mangler::EscapeMangler,
+    mangler::Mangler,
+    sourcemap::SourceMap,
     syntax::{ModulePath, PathOrigin},
 };
 
@@ -18,12 +21,11 @@ pub fn compile_wesl_shader(
 ) -> color_eyre::Result<ReflectedModule> {
     let root = root.as_ref();
     let root_path = module_path(root)?;
-    let mut compiler = Wesl::new(base);
-    compiler.set_options(CompileOptions {
-        mangle_root: true,
+    let compiler = Compiler::new(CompileOptions {
+        mangle_main: true,
         ..CompileOptions::default()
     });
-    let compiled = compiler.compile(&root_path)?;
+    let compiled = compiler.compile_module(base, &root_path)?;
     let source_map = compiled
         .sourcemap
         .as_ref()
@@ -40,14 +42,14 @@ pub fn compile_wesl_shader(
         let Some(name) = ty.name.as_deref() else {
             continue;
         };
-        let Some((path, declaration)) = source_map.get_decl(name) else {
+        let Some(item) = source_map.item(name) else {
             continue;
         };
         identities.insert(
             handle,
             DeclarationIdentity {
-                module_path: path.to_string(),
-                name: declaration.to_owned(),
+                module_path: item.path.to_string(),
+                name: item.name.to_owned(),
             },
         );
     }
@@ -107,8 +109,8 @@ fn module_path(root: &Path) -> color_eyre::Result<ModulePath> {
 }
 
 fn restore_name(name: &mut String, source_map: &impl SourceMap, mangler: &EscapeMangler) {
-    if let Some((_, declaration)) = source_map.get_decl(name) {
-        *name = declaration.to_owned();
+    if let Some(item) = source_map.item(name) {
+        *name = item.name.to_owned();
     } else if let Some((_, declaration)) = mangler.unmangle(name) {
         *name = declaration;
     }
